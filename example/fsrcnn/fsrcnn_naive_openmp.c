@@ -1,942 +1,560 @@
-// This code is the C implementation of FSRCNN algorithm for YUV 4:2:0 video interpolation
-// Milad Abdollahzadeh, 09/02/2017
+// FSRCNN (56,12,4) untuk interpolasi video YUV 4:2:0 (x2) pada CPU multi-core
+// Basis implementasi: Milad Abdollahzadeh, 09/02/2017
+//
+// Dimodifikasi untuk penelitian tesis:
+//   "Analisis Pengaruh Pola Akses Feature Map dan Paralelisasi Spasial terhadap
+//    Tekanan Bandwidth Memori dan Efisiensi Inferensi Layer FSRCNN Berkanal Kecil
+//    pada CPU Multi-Core" - Wa Ode Ratna Adiningsih (D082252009)
+//
+// Variabel bebas (parameter program):
+//   1. Layout feature map : CHW atau HWC (dipakai di seluruh 8 lapisan)
+//   2. Jumlah thread      : 1, 2, 4, 8 (paralelisasi OpenMP pada dimensi spasial,
+//                           yaitu baris (tinggi) feature map keluaran)
+// Satu modul yang sama dipakai untuk semua skenario; yang berbeda hanya parameternya.
+//
+// Keluaran pengukuran (per lapisan, dengan resolusi nanodetik via clock_gettime):
+//   - waktu eksekusi (efisiensi inferensi) dan throughput (GFLOP/s, FPS)
+//   - arithmetic intensity teoretis (FLOP/byte) dan estimasi bandwidth minimum
+//     (compulsory traffic / waktu) sebagai proksi tekanan bandwidth memori
+// Cache miss dan bandwidth DRAM aktual diukur dari luar (non-intrusif) dengan perf, mis.:
+//   perf stat -e cycles,instructions,L1-dcache-load-misses,LLC-load-misses,LLC-loads
+//     ./fsrcnn_naive_openmp in.yuv out.yuv 150 hwc 4
+//
+// Kompilasi : gcc -O3 -fopenmp -o fsrcnn_naive_openmp fsrcnn_naive_openmp.c -lm
+// Pemakaian : ./fsrcnn_naive_openmp <in.yuv> <out.yuv> [frames] [chw|hwc] [threads] [csv] [width] [height]
+//   frames  : default 150
+//   layout  : default chw
+//   threads : default OMP_NUM_THREADS / omp_get_max_threads()
+//   csv     : file CSV untuk ditambahkan hasil per lapisan (opsional, "-" = tidak ada)
+//   width, height : resolusi input, default 176x144 (QCIF)
+
+#define _POSIX_C_SOURCE 199309L
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <omp.h>
 #include <string.h>
+#include <time.h>
+#include <omp.h>
 
-void FSRCNN(double *img_hr, double *img_lr, int rows, int cols, int scale);
-void imfilter(double *img, double *kernel, double *img_fltr, int rows, int cols, int padsize);
-void pad_image(double *img, double *img_pad, int rows, int cols, int padsize);
-void PReLU(double *img_fltr, int rows, int cols, double bias, double prelu_coeff);
-double Max(double a, double b);
-double Min(double a, double b);
-void imadd(double *img_fltr_crnt, double *img_fltr_prev, int cols, int rows);
-void deconv(double *img_input, double *img_output, double *kernel, int cols, int rows, int stride);
-void double_2_uint8(double *double_img, unsigned char *uint8_img, int cols, int rows);
+#define SCALE      2
+#define NUM_LAYERS 8
 
-double weights_layer1[1400];
-double biases_layer1[56];
-double weights_layer2[672];
-double biases_layer2[12];
-double weights_layer3[1296];
-double biases_layer3[12];
-double weights_layer4[1296];
-double biases_layer4[12];
-double weights_layer5[1296];
-double biases_layer5[12];
-double weights_layer6[1296];
-double biases_layer6[12];
-double weights_layer7[672];
-double biases_layer7[56];
-double weights_layer8[4536];
-double biases_layer8;
+typedef enum { LAYOUT_CHW = 0, LAYOUT_HWC = 1 } layout_t;
+
+static const char *layout_name[] = { "CHW", "HWC" };
+
+// Konfigurasi lapisan FSRCNN (56,12,4): feature extraction, shrinking, mapping x4, expanding, deconvolution
+typedef struct
+{
+	const char *name;
+	int cin;           // jumlah kanal masukan
+	int cout;          // jumlah kanal keluaran (filter)
+	int ksize;         // ukuran kernel (ksize x ksize)
+	double prelu;      // koefisien PReLU
+	const char *wfile;
+	const char *bfile;
+	double *w;         // bobot asli: [cout][cin][ky][kx] (deconv: [cin][ky][kx])
+	double *w_hwc;     // bobot tersusun ulang untuk HWC: [cout][ky][kx][cin] (deconv: [ky][kx][cin])
+	double *b;
+} layer_t;
+
+static layer_t layers[NUM_LAYERS] = {
+	{ "L1 feature_extraction", 1,  56, 5, -0.8986, "weights_layer1.txt", "biasess_layer1.txt" },
+	{ "L2 shrinking",          56, 12, 1,  0.3236, "weights_layer2.txt", "biasess_layer2.txt" },
+	{ "L3 mapping1",           12, 12, 3,  0.2288, "weights_layer3.txt", "biasess_layer3.txt" },
+	{ "L4 mapping2",           12, 12, 3,  0.2476, "weights_layer4.txt", "biasess_layer4.txt" },
+	{ "L5 mapping3",           12, 12, 3,  0.3495, "weights_layer5.txt", "biasess_layer5.txt" },
+	{ "L6 mapping4",           12, 12, 3,  0.7806, "weights_layer6.txt", "biasess_layer6.txt" },
+	{ "L7 expanding",          12, 56, 1,  0.0087, "weights_layer7.txt", "biasess_layer7.txt" },
+	{ "L8 deconvolution",      56, 1,  9,  0.0,    "weights_layer8.txt", "biasess_layer8.txt" },
+};
+
+// Statistik per lapisan (akumulasi seluruh frame)
+static double layer_time_ns[NUM_LAYERS];
+static double layer_flops[NUM_LAYERS];   // FLOP per frame
+static double layer_bytes[NUM_LAYERS];   // byte compulsory per frame (input + output + bobot)
+
+static void load_txt(const char *fname, double *dst, int n);
+static void init_layers(void);
+static void free_layers(void);
+static void compute_layer_cost(int rows, int cols);
+static double now_ns(void);
+
+static void FSRCNN(double *img_hr, const double *img_lr, double **fmap, int rows, int cols, layout_t layout);
+static void conv_chw(const double *in, double *out, const layer_t *L, int rows, int cols);
+static void conv_hwc(const double *in, double *out, const layer_t *L, int rows, int cols);
+static void deconv_chw(const double *in, double *out, const layer_t *L, int rows, int cols);
+static void deconv_hwc(const double *in, double *out, const layer_t *L, int rows, int cols);
+static void double_2_uint8(const double *double_img, unsigned char *uint8_img, int n);
+static void upsample_chroma(const unsigned char *in, unsigned char *out, int inCols, int inRows);
+static void report(FILE *csv, layout_t layout, int threads, int frames, int rows, int cols, double total_ns, double wall_ns);
+
+static inline int clampi(int v, int lo, int hi)
+{
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static inline double prelu(double v, double coeff)
+{
+	return v > 0 ? v : coeff * v;
+}
 
 int main(int argc, char *argv[])
 {
+	if (argc < 3)
+	{
+		fprintf(stderr, "Pemakaian: %s <in.yuv> <out.yuv> [frames] [chw|hwc] [threads] [csv] [width] [height]\n", argv[0]);
+		return 1;
+	}
+
 	char *inFile = argv[1];
 	char *outFile = argv[2];
+	int num = (argc > 3) ? atoi(argv[3]) : 150;                    // Jumlah frame
+	layout_t layout = LAYOUT_CHW;
+	if (argc > 4 && (strcmp(argv[4], "hwc") == 0 || strcmp(argv[4], "HWC") == 0))
+		layout = LAYOUT_HWC;
+	int threads = (argc > 5) ? atoi(argv[5]) : omp_get_max_threads();
+	const char *csvFile = (argc > 6 && strcmp(argv[6], "-") != 0) ? argv[6] : NULL;
+	int inCols = (argc > 7) ? atoi(argv[7]) : 176;                // Lebar video input
+	int inRows = (argc > 8) ? atoi(argv[8]) : 144;                // Tinggi video input
 
-	//Upsampler parameters
-	int scale = 2;
+	if (num <= 0 || threads <= 0 || inCols <= 0 || inRows <= 0)
+	{
+		fprintf(stderr, "Parameter tidak valid\n");
+		return 1;
+	}
+	omp_set_num_threads(threads);
 
-	//Compressed Assault Cube
-	int num = 150; //Number of frames to interpolate
-	int inCols = 176; //Width of input (downsampled) video
-	int inRows = 144; //Height of input (downsampled) video
+	int outCols = inCols * SCALE;
+	int outRows = inRows * SCALE;
 
-	int outCols = inCols*scale;
-	int outRows = inRows*scale;
+	FILE *inFp = fopen(inFile, "rb");
+	if (inFp == NULL) { fprintf(stderr, "Gagal membuka input %s\n", inFile); return 1; }
+	FILE *outFp = fopen(outFile, "wb");
+	if (outFp == NULL) { fprintf(stderr, "Gagal membuka output %s\n", outFile); return 1; }
 
-	FILE *inFp, *outFp;
+	init_layers();
+	compute_layer_cost(inRows, inCols);
 
-	inFp = fopen(inFile, "rb");
-	if (inFp == NULL)
-	{
-		printf("\n We have null pointer \n");
-	}
-	outFp = fopen(outFile, "wb");
-	if (outFp == NULL)
-	{
-		printf("\n We have null pointer \n");
-	}
+	// Seluruh buffer dialokasikan sekali di luar loop frame agar malloc/free
+	// tidak ikut terukur sebagai waktu inferensi.
+	unsigned char *inBuf = (unsigned char *)malloc(inCols * inRows);
+	unsigned char *outBuf = (unsigned char *)malloc(outCols * outRows);
+	double *inBuf_tmp = (double *)malloc(inCols * inRows * sizeof(double));
+	double *outBuf_tmp = (double *)malloc(outCols * outRows * sizeof(double));
+	double *fmap[NUM_LAYERS - 1];
+	for (int l = 0; l < NUM_LAYERS - 1; l++)
+		fmap[l] = (double *)malloc((size_t)inRows * inCols * layers[l].cout * sizeof(double));
 
-    FILE *weights_layer1_ptr;
-	weights_layer1_ptr = fopen("weights_layer1.txt", "r");
-	if (weights_layer1_ptr == NULL) { printf("Error in the reading weights of first layer\n"); };
-	
-	for (int i = 0; i < 1400; i++)
-	{
-		fscanf(weights_layer1_ptr, "%lf", &weights_layer1[i]);
-		//printf("%lf\n", weights_layer1[i]);
-	}
-	fclose(weights_layer1_ptr);
-    FILE *biases_layer1_ptr;
-	biases_layer1_ptr = fopen("biasess_layer1.txt", "r");
-	if (biases_layer1_ptr == NULL) { printf("Error in the reading biases of first layer\n"); };
-	
-	for (int i = 0; i < 56; i++)
-	{
-		fscanf(biases_layer1_ptr, "%lf", &biases_layer1[i]);
-	}
-	fclose(biases_layer1_ptr);
-	FILE *weights_layer2_ptr;
-    weights_layer2_ptr = fopen("weights_layer2.txt", "r");
-	if (weights_layer2_ptr == NULL) { printf("Error in the reading weights of 2nd layer\n"); };
-	// Note: weights must be saved in a way which that corresponding weights of each channel can be read by pointer concept ==>> for this layer 12X56 matrix is reshaped to (12X56)*1 vector
-	
-	for (int i = 0; i < 672; i++)
-	{
-		fscanf(weights_layer2_ptr, "%lf", &weights_layer2[i]);
-	}
-	fclose(weights_layer2_ptr);    
-    FILE *biases_layer2_ptr;
-	biases_layer2_ptr = fopen("biasess_layer2.txt", "r");
-	if (biases_layer2_ptr == NULL) { printf("Error in the reading biases of 2nd layer\n"); };
-	
-	for (int i = 0; i < 12; i++)
-	{
-		fscanf(biases_layer2_ptr, "%lf", &biases_layer2[i]);
-	}
-	fclose(biases_layer2_ptr);
-    FILE *weights_layer3_ptr;
-	weights_layer3_ptr = fopen("weights_layer3.txt", "r");
-	if (weights_layer3_ptr == NULL) { printf("Error in the reading weights of 3rd layer\n"); };
-	
-	for (int i = 0; i < 1296; i++)
-	{
-		fscanf(weights_layer3_ptr, "%lf", &weights_layer3[i]);
-	}
-	fclose(weights_layer3_ptr);
-
-	FILE *biases_layer3_ptr;
-	biases_layer3_ptr = fopen("biasess_layer3.txt", "r");
-	if (biases_layer3_ptr == NULL) { printf("Error in the reading biases of 3rd layer\n"); };
-	
-	for (int i = 0; i < 12; i++)
-	{
-		fscanf(biases_layer3_ptr, "%lf", &biases_layer3[i]);
-	}
-	fclose(biases_layer3_ptr);
-
-    FILE *weights_layer4_ptr;
-	weights_layer4_ptr = fopen("weights_layer4.txt", "r");
-	if (weights_layer4_ptr == NULL) { printf("Error in the reading weights of 4th layer\n"); };
-	
-	for (int i = 0; i < 1296; i++)
-	{
-		fscanf(weights_layer4_ptr, "%lf", &weights_layer4[i]);
-	}
-	fclose(weights_layer4_ptr);
-
-    FILE *biases_layer4_ptr;
-	biases_layer4_ptr = fopen("biasess_layer4.txt", "r");
-	if (biases_layer4_ptr == NULL) { printf("Error in the reading biases of 4th layer\n"); };
-	
-	for (int i = 0; i < 12; i++)
-	{
-		fscanf(biases_layer4_ptr, "%lf", &biases_layer4[i]);
-	}
-	fclose(biases_layer4_ptr);
-
-    FILE *weights_layer5_ptr;
-	weights_layer5_ptr = fopen("weights_layer5.txt", "r");
-	
-	for (int i = 0; i < 1296; i++)
-	{
-		fscanf(weights_layer5_ptr, "%lf", &weights_layer5[i]);
-	}
-	fclose(weights_layer5_ptr);
-
-	FILE *biases_layer5_ptr;
-	biases_layer5_ptr = fopen("biasess_layer5.txt", "r");
-	if (biases_layer5_ptr == NULL) { printf("Error in the reading biases of 5th layer\n"); };
-	
-	for (int i = 0; i < 12; i++)
-	{
-		fscanf(biases_layer5_ptr, "%lf", &biases_layer5[i]);
-	}
-	fclose(biases_layer5_ptr);
-    
-	FILE *weights_layer6_ptr;
-	weights_layer6_ptr = fopen("weights_layer6.txt", "r");
-	if (weights_layer6_ptr == NULL) { printf("Error in the reading weights of 6th layer\n"); };
-	
-	for (int i = 0; i < 1296; i++)
-	{
-		fscanf(weights_layer6_ptr, "%lf", &weights_layer6[i]);
-	}
-	fclose(weights_layer6_ptr);
-	// Reading biases of 6th layer
-	FILE *biases_layer6_ptr;
-	biases_layer6_ptr = fopen("biasess_layer6.txt", "r");
-	if (biases_layer6_ptr == NULL) { printf("Error in the reading biases of 6th layer\n"); };
-	for (int i = 0; i < 12; i++)
-	{
-		fscanf(biases_layer6_ptr, "%lf", &biases_layer6[i]);
-	}
-	fclose(biases_layer6_ptr);
-
-	FILE *weights_layer7_ptr;
-    weights_layer7_ptr = fopen("weights_layer7.txt", "r");
-	if (weights_layer7_ptr == NULL) { printf("Error in the reading weights of 7th layer\n"); };
-	
-	for (int i = 0; i < 672; i++)
-	{
-		fscanf(weights_layer7_ptr, "%lf", &weights_layer7[i]);
-	}
-	fclose(weights_layer7_ptr);
-	// Reading biases of 7th layer
-	FILE *biases_layer7_ptr;
-	biases_layer7_ptr = fopen("biasess_layer7.txt", "r");
-	if (biases_layer7_ptr == NULL) { printf("Error in the reading biases of 7th layer\n"); };
-	
-	for (int i = 0; i < 56; i++)
-	{
-		fscanf(biases_layer7_ptr, "%lf", &biases_layer7[i]);
-	}
-	fclose(biases_layer7_ptr);
-
-    FILE *weights_layer8_ptr;
-	weights_layer8_ptr = fopen("weights_layer8.txt", "r");
-	if (weights_layer8_ptr == NULL) { printf("Error in the reading weights of 8th layer\n"); };
-	
-	for (int i = 0; i < 4536; i++)
-	{
-		fscanf(weights_layer8_ptr, "%lf", &weights_layer8[i]);
-	}
-	fclose(weights_layer8_ptr);
-
-	FILE *biases_layer8_ptr;
-	biases_layer8_ptr = fopen("biasess_layer8.txt", "r");
-	if (biases_layer8_ptr == NULL) { printf("Error in the reading biases of 8th layer\n"); };
-	fscanf(biases_layer8_ptr, "%lf", &biases_layer8);
-	fclose(biases_layer8_ptr);
-
-
-	// To read and write each frame in an unsigned character format
-	unsigned char *inBuf = (unsigned char *)malloc(inCols*inRows*sizeof(unsigned char));
-	unsigned char *outBuf = (unsigned char *)malloc(outCols*outRows*sizeof(unsigned char));
-	// To work with each pixel in the range of 0~1
-	double *inBuf_tmp = (double *)malloc(inCols*inRows*sizeof(double));
-	double *outBuf_tmp = (double *)malloc(outCols*outRows*sizeof(double));
+	double total_ns = 0;
+	double wall_start = now_ns();
 
 	for (int fcnt = 0; fcnt < num; fcnt++)
 	{
-		//////// Interpolate each frame using FSRCNN for Y component and simple repitition for U and V components
-		// Pointer to obtain value of each tpixel of input frame
-		unsigned char *inP = inBuf;
-		double *inP_tmp = inBuf_tmp;
-		// Pointer to obtain value of each pixel of output frame
-		unsigned char *outP = outBuf;
-		double *outP_tmp = outBuf_tmp;
-
-		//Y Component
-		fread(inBuf, sizeof(unsigned char), inCols*inRows, inFp);
-		int i, j;
-
-		for (i = 0; i<inRows; i++)
-		for (j = 0; j<inCols; j++)
+		//Y Component: FSRCNN
+		if (fread(inBuf, 1, inCols * inRows, inFp) != (size_t)(inCols * inRows))
 		{
-			int cnt = i*inCols + j;
-			int x = *inP++;
-			*(inP_tmp + cnt) = (double)(x / 255.0);
+			fprintf(stderr, "Input habis pada frame %d\n", fcnt);
+			num = fcnt;
+			break;
 		}
 
-		FSRCNN(outP_tmp, inP_tmp, inRows, inCols, scale);
+		for (int i = 0; i < inCols * inRows; i++)
+			inBuf_tmp[i] = inBuf[i] / 255.0;
 
-		outP_tmp = outBuf_tmp;
-		
-		for (i = 0; i<inRows*scale; i++)
-		for (j = 0; j<inCols*scale; j++)
-		{
-			int cnt = i*inCols*scale + j;
-			*(outP_tmp + cnt) = *(outP_tmp + cnt) * 255;
-		}
+		double t0 = now_ns();
+		FSRCNN(outBuf_tmp, inBuf_tmp, fmap, inRows, inCols, layout);
+		total_ns += now_ns() - t0;
 
+		for (int i = 0; i < outCols * outRows; i++)
+			outBuf_tmp[i] = outBuf_tmp[i] * 255;
 
-		double_2_uint8( outP_tmp, outP, outCols, outRows);
+		double_2_uint8(outBuf_tmp, outBuf, outCols * outRows);
+		fwrite(outBuf, 1, outCols * outRows, outFp);
 
-		fwrite(outBuf, sizeof(unsigned char), outCols*outRows, outFp);
+		//U Component: simple repetition
+		fread(inBuf, 1, inCols * inRows / 4, inFp);
+		upsample_chroma(inBuf, outBuf, inCols, inRows);
+		fwrite(outBuf, 1, outCols * outRows / 4, outFp);
 
-		//U Component
-		fread(inBuf, sizeof(unsigned char), inCols*inRows / 4, inFp);
-
-		inP = inBuf;
-		outP = outBuf;
-
-		for (i = 0; i < inRows / 2; i++)
-		for (j = 0; j < inCols / 2; j++) {
-
-			int cnt = 2 * (i * outCols / 2 + j);
-
-			unsigned char x = *inP++;
-
-			*(outP + cnt) = x;
-			*(outP + cnt + 1) = x;
-			*(outP + cnt + outCols / 2) = x;
-			*(outP + cnt + outCols / 2 + 1) = x;
-
-		}
-
-		fwrite(outBuf, sizeof(unsigned char), outCols*outRows / 4, outFp);
-
-		// V COmponent
-		fread(inBuf, sizeof(unsigned char), inCols*inRows / 4, inFp);
-		inP = inBuf;
-		outP= outBuf;
-
-		for (i = 0; i < inRows / 2; i++)
-		for (j = 0; j < inCols / 2; j++) {
-
-			int cnt = 2 * (i*outCols / 2 + j);
-
-			unsigned char x = *inP++;
-
-			*(outP + cnt) = x;
-			*(outP + cnt + 1) = x;
-			*(outP + cnt + outCols / 2) = x;
-			*(outP + cnt + outCols / 2 + 1) = x;
-
-		}
-
-		fwrite(outBuf, sizeof(unsigned char), outCols*outRows / 4, outFp);
-		
+		// V Component: simple repetition
+		fread(inBuf, 1, inCols * inRows / 4, inFp);
+		upsample_chroma(inBuf, outBuf, inCols, inRows);
+		fwrite(outBuf, 1, outCols * outRows / 4, outFp);
 	}
+	double wall_ns = now_ns() - wall_start;
+
+	FILE *csv = NULL;
+	if (csvFile != NULL)
+	{
+		csv = fopen(csvFile, "a+");
+		if (csv == NULL)
+			fprintf(stderr, "Gagal membuka CSV %s\n", csvFile);
+	}
+	report(csv, layout, threads, num, inRows, inCols, total_ns, wall_ns);
+	if (csv != NULL)
+		fclose(csv);
+
+	fclose(inFp);
+	fclose(outFp);
+	for (int l = 0; l < NUM_LAYERS - 1; l++)
+		free(fmap[l]);
 	free(inBuf);
-	inBuf = NULL;
 	free(inBuf_tmp);
-	inBuf_tmp = NULL;
 	free(outBuf);
-	outBuf = NULL;
 	free(outBuf_tmp);
-	outBuf_tmp = NULL;
+	free_layers();
+	return 0;
 }
 
-void FSRCNN(double *img_hr, double *img_lr, int rows, int cols, int scale)
+static void FSRCNN(double *img_hr, const double *img_lr, double **fmap, int rows, int cols, layout_t layout)
 {
-	// General Settings
-	int num_layers = 8;
-
-	/////////// Convolution1 -------- Layer1
-	// Reading weights of first layer
-	
-	// Reading biases of first layer
-	
-	// other parameters
-	int filtersize = 25; //5X5
-	int patchsize = 5;
-	int padsize = (patchsize - 1) / 2;
-	int num_filters = 56;
-	double prelu_coeff_layer1 = -0.8986;
-
-	// Convolution
-	double *img_fltr_1 = (double *)malloc(rows * cols * num_filters * sizeof(double));
-	double *kernel = (double *)malloc(filtersize*sizeof(double));
-
-	double *img_fltr_p1 = img_fltr_1; // Pointer to img_fltr1 ==>> Using this way to be able to shift it to access data
-
-	int cnt_weight = 0;
-	
-	double bias_tmp;
-    #pragma omp parallel for firstprivate(kernel,cnt_weight,img_fltr_p1,bias_tmp)
-	for (int i = 0; i < num_filters; i++)
+	// Lapisan 1-7: konvolusi + PReLU. Input lapisan 1 hanya satu kanal sehingga CHW == HWC.
+	const double *in = img_lr;
+	for (int l = 0; l < NUM_LAYERS - 1; l++)
 	{
-		imfilter(img_lr, weights_layer1+i*filtersize, img_fltr_p1+i*cols*rows, rows, cols, padsize);
-		PReLU(img_fltr_p1+i*cols*rows, rows, cols, biases_layer1[i], prelu_coeff_layer1);
-
+		double t0 = now_ns();
+		if (layout == LAYOUT_CHW)
+			conv_chw(in, fmap[l], &layers[l], rows, cols);
+		else
+			conv_hwc(in, fmap[l], &layers[l], rows, cols);
+		layer_time_ns[l] += now_ns() - t0;
+		in = fmap[l];
 	}
 
-	/////////// Convolution2 ------------------- Layer 2~7
-
-	/////////// Layer2
-	// Reading weights of 2nd layer
-	
-	// Reading biases of 2nd layer
-	
-	// Other parameters
-	int filtersize2 = 1; //1X1
-	int patchsize2 = 1;
-	int padsize2 = (patchsize2 - 1) / 2;
-	int num_filters2 = 12;
-	int num_channels2 = 56;
-	double prelu_coeff_layer2 = 0.3236;
-	// Convolution
-	double *img_fltr_2 = (double *)calloc(rows * cols * num_filters2 , sizeof(double)); // use calloc to initialize all variables to zero
-	//double *img_fltr_2_tmp = (double *)malloc(rows * cols * sizeof(double));
-	double *kernel2 = (double *)malloc(filtersize2*sizeof(double));
-	double *img_fltr_p2 = img_fltr_2; // Pointer to img_fltr2
-	
-
-	cnt_weight = 0;
-    #pragma omp parallel for firstprivate(biases_layer2)
-	for (int i = 0; i < num_filters2; i++)
-	{
-		//double *img_fltr_2_tmp = (double *) alloca(rows*cols*sizeof(double));
-		double img_fltr_2_tmp[rows*cols];
-		//img_fltr_p1 = img_fltr_1; // Return pointer to the first of array which contains feature map of previous layer
-		for (int j = 0; j < num_channels2; j++)
-		{
-			// reading corresponding weights to kernel
-			//for (int cnt_kernel = 0; cnt_kernel < filtersize2; cnt_kernel++)
-			//{
-			//	*(kernel2 + cnt_kernel) = weights_layer2[cnt_weight + cnt_kernel];
-			//}
-
-			//imfilter(img_fltr_p1, kernel2, img_fltr_2_tmp, rows, cols, padsize2);
-			imfilter(img_fltr_1+j*rows*cols, weights_layer2+(i*num_channels2+j)*filtersize2, img_fltr_2_tmp, rows, cols, padsize2);
-			imadd(img_fltr_p2+i*cols*rows, img_fltr_2_tmp, cols, rows);
-
-			//cnt_weight = cnt_weight + filtersize2;
-			//img_fltr_p1 = img_fltr_p1 + rows*cols;
-		}
-		//bias_tmp = biases_layer2[i];
-		PReLU(img_fltr_p2+i*rows*cols, rows, cols, biases_layer2[i], prelu_coeff_layer2);
-		//img_fltr_p2 = img_fltr_p2 + rows*cols;
-	}
-
-	free(img_fltr_1);
-	img_fltr_1 = NULL;
-	free(kernel);
-	kernel = NULL;
-	//free(img_fltr_2_tmp);
-	//img_fltr_2_tmp = NULL;
-	
-	/////////// Layer3
-	// Reading weights of 3rd layer
-	
-	// Reading biases of 3rd layer
-	
-	// Other parameters
-	int filtersize3 = 9; //3X3
-	int patchsize3 = 3;
-	int padsize3 = (patchsize3 - 1) / 2;
-	int num_filters3 = 12;
-	int num_channels3 = 12;
-	double prelu_coeff_layer3 = 0.2288;
-	// Convolution
-	double *img_fltr_3 = (double *)calloc(rows * cols * num_filters3 , sizeof(double));
-	double *kernel3 = (double *)malloc(filtersize3*sizeof(double));
-	double *img_fltr_p3 = img_fltr_3; // Pointer to img_fltr2
-	//double *img_fltr_3_tmp = (double *)malloc(rows * cols * sizeof(double));
-
-	cnt_weight = 0;
-	#pragma omp parallel for
-	for (int i = 0; i < num_filters3; i++)
-	{
-		//img_fltr_p2 = img_fltr_2; // Return pointer to the first cell of array which contains feature maps of previous layer
-		//double *img_fltr_3_tmp = (double *) alloca(rows*cols * sizeof(double));
-		double img_fltr_3_tmp[rows*cols];
-		for (int j = 0; j < num_channels3; j++)
-		{
-			// reading corresponding weights to kernel
-			//for (int cnt_kernel = 0; cnt_kernel < filtersize3; cnt_kernel++)
-			//{
-			//	*(kernel3 + cnt_kernel) = weights_layer3[cnt_weight + cnt_kernel];
-			//}
-
-			imfilter(img_fltr_p2+j*rows*cols, weights_layer3+(i*num_channels3+j)*filtersize3, img_fltr_3_tmp, rows, cols, padsize3);
-			imadd(img_fltr_p3+i*rows*cols, img_fltr_3_tmp, cols, rows);
-
-			//cnt_weight = cnt_weight + filtersize3;
-			//img_fltr_p2 = img_fltr_p2 + rows*cols;
-		}
-		//bias_tmp = biases_layer3[i];
-		PReLU(img_fltr_p3+i*rows*cols, rows, cols, biases_layer3[i], prelu_coeff_layer3);
-		//img_fltr_p3 = img_fltr_p3 + rows*cols;
-	}
-
-	free(img_fltr_2);
-	img_fltr_2 = NULL;
-	//free(img_fltr_2_tmp);
-	//img_fltr_2_tmp = NULL;
-	free(kernel2);
-	kernel2 = NULL;
-	//free(img_fltr_3_tmp);
-	//img_fltr_3_tmp = NULL;
-
-	/////////// Layer4
-	// Reading weights of 4th layer
-	
-	// Reading biases of 4th layer
-	
-	// Other parameters
-	int filtersize4 = 9; //3X3
-	int patchsize4 = 3;
-	int padsize4 = (patchsize4 - 1) / 2;
-	int num_filters4 = 12;
-	int num_channels4 = 12;
-	double prelu_coeff_layer4 = 0.2476;
-	// Convolution
-	double *img_fltr_4 = (double *)calloc(rows * cols * num_filters4 , sizeof(double));
-	double *kernel4 = (double *)malloc(filtersize4*sizeof(double));
-	double *img_fltr_p4 = img_fltr_4; // Pointer to img_fltr4
-	//double *img_fltr_4_tmp = (double *)malloc(rows * cols * sizeof(double));
-
-	cnt_weight = 0;
-    #pragma omp parallel for
-	for (int i = 0; i < num_filters4; i++)
-	{
-		//img_fltr_p3 = img_fltr_3;
-		//double *img_fltr_4_tmp = (double *) alloca(rows*cols * sizeof(double)); 
-		double img_fltr_4_tmp[rows*cols];
-		for (int j = 0; j < num_channels4; j++)
-		{
-			// reading corresponding weights to kernel
-			//for (int cnt_kernel = 0; cnt_kernel < filtersize4; cnt_kernel++)
-			//{
-			//	*(kernel4 + cnt_kernel) = weights_layer4[cnt_weight + cnt_kernel];
-			//}
-
-			imfilter(img_fltr_p3 + j*rows*cols, weights_layer4+(i*num_channels4+j) * filtersize4, img_fltr_4_tmp, rows, cols, padsize4);
-			imadd(img_fltr_p4+i*rows*cols, img_fltr_4_tmp, cols, rows);
-
-			//cnt_weight = cnt_weight + filtersize4;
-			//img_fltr_p3 = img_fltr_p3 + rows*cols;
-		}
-		bias_tmp = biases_layer4[i];
-		PReLU(img_fltr_p4+i*rows*cols, rows, cols, bias_tmp, prelu_coeff_layer4);
-		//img_fltr_p4 = img_fltr_p4 + rows*cols;
-	}
-
-	free(img_fltr_3);
-	img_fltr_3 = NULL;
-	//free(img_fltr_3_tmp);
-	//img_fltr_3_tmp = NULL;
-	free(kernel3);
-	kernel3 = NULL;
-	//free(img_fltr_4_tmp);
-	//img_fltr_4_tmp = NULL;
-
-	/////////// Layer5
-	// Reading weights of 5th layer
-	
-	// Reading biases of 5th layer
-	
-	// Other parameters
-	int filtersize5 = 9; //3X3
-	int patchsize5 = 3;
-	int padsize5 = (patchsize5 - 1) / 2;
-	int num_filters5 = 12;
-	int num_channels5 = 12;
-	double prelu_coeff_layer5 = 0.3495;
-	// Convolution
-	double *img_fltr_5 = (double *)calloc(rows * cols * num_filters5 , sizeof(double));
-	double *kernel5 = (double *)malloc(filtersize5*sizeof(double));
-	double *img_fltr_p5 = img_fltr_5; // Pointer to img_fltr5
-	//double *img_fltr_5_tmp = (double *)malloc(rows * cols * sizeof(double));
-
-	cnt_weight = 0;
-    #pragma omp parallel for
-	for (int i = 0; i < num_filters5; i++)
-	{
-		//img_fltr_p4 = img_fltr_4;
-		//double *img_fltr_5_tmp = (double *) alloca(rows*cols*sizeof(double));
-		double img_fltr_5_tmp[rows*cols];
-		for (int j = 0; j < num_channels5; j++)
-		{
-			// reading corresponding weights to kernel
-			//for (int cnt_kernel = 0; cnt_kernel < filtersize5; cnt_kernel++)
-			//{
-			//	*(kernel5 + cnt_kernel) = weights_layer5[cnt_weight + cnt_kernel];
-			//}
-
-			imfilter(img_fltr_p4+j*rows*cols, weights_layer5+(i*num_channels5+j) * filtersize5, img_fltr_5_tmp, rows, cols, padsize5);
-			imadd(img_fltr_p5+i*rows*cols, img_fltr_5_tmp, cols, rows);
-
-			//cnt_weight = cnt_weight + filtersize5;
-			//img_fltr_p4 = img_fltr_p4 + rows*cols;
-		}
-		//bias_tmp = biases_layer5[i];
-		PReLU(img_fltr_p5+i*rows*cols, rows, cols, biases_layer5[i], prelu_coeff_layer5);
-		//img_fltr_p5 = img_fltr_p5 + rows*cols;
-	}
-
-	free(img_fltr_4);
-	img_fltr_4 = NULL;
-	//free(img_fltr_4_tmp);
-	//img_fltr_4_tmp = NULL;
-	free(kernel4);
-	kernel4 = NULL;
-	//free(img_fltr_5_tmp);
-	//img_fltr_5_tmp = NULL;
-
-	/////////// Layer6
-	// Reading weights of 6th layer
-	
-	// Other parameters
-	int filtersize6 = 9; //3X3
-	int patchsize6 = 3;
-	int padsize6 = (patchsize6 - 1) / 2;
-	int num_filters6 = 12;
-	int num_channels6 = 12;
-	double prelu_coeff_layer6 = 0.7806;
-	// Convolution
-	double *img_fltr_6 = (double *)calloc(rows * cols * num_filters6 , sizeof(double));
-	double *kernel6 = (double *)malloc(filtersize6*sizeof(double));
-	double *img_fltr_p6 = img_fltr_6; // Pointer to img_fltr6
-	//double *img_fltr_6_tmp = (double *)malloc(rows * cols * sizeof(double));
-
-	cnt_weight = 0;
-    #pragma omp parallel for
-	for (int i = 0; i < num_filters6; i++)
-	{
-		//img_fltr_p5 = img_fltr_5;
-		//double *img_fltr_6_tmp = (double *) alloca(rows*cols*sizeof(double));
-		double img_fltr_6_tmp[rows*cols];
-		for (int j = 0; j < num_channels6; j++)
-		{
-			// reading corresponding weights to kernel
-			//for (int cnt_kernel = 0; cnt_kernel < filtersize6; cnt_kernel++)
-			//{
-			//	*(kernel6 + cnt_kernel) = weights_layer6[cnt_weight + cnt_kernel];
-			//}
-
-			imfilter(img_fltr_p5+j*rows*cols, weights_layer6+(i*num_channels6+j)*filtersize6, img_fltr_6_tmp, rows, cols, padsize6);
-			imadd(img_fltr_p6+i*rows*cols, img_fltr_6_tmp, cols, rows);
-
-			//cnt_weight = cnt_weight + filtersize6;
-			//img_fltr_p5 = img_fltr_p5 + rows*cols;
-		}
-		//bias_tmp = biases_layer6[i];
-		PReLU(img_fltr_p6+i*rows*cols, rows, cols, biases_layer6[i], prelu_coeff_layer6);
-		//img_fltr_p6 = img_fltr_p6 + rows*cols;
-	}
-
-	free(img_fltr_5);
-	img_fltr_5 = NULL;
-	//free(img_fltr_5_tmp);
-	//img_fltr_5_tmp = NULL;
-	free(kernel5);
-	kernel5 = NULL;
-
-	/////////// Layer7
-	// Reading weights of 7th layer
-	// Other parameters
-	int filtersize7 = 1; //1X1
-	int patchsize7 = 1;
-	int padsize7 = (patchsize7 - 1) / 2;
-	int num_filters7 = 56;
-	int num_channels7 = 12;
-	double prelu_coeff_layer7 = 0.0087;
-	// Convolution
-	double *img_fltr_7 = (double *)calloc(rows * cols * num_filters7 , sizeof(double));
-	double *kernel7 = (double *)malloc(filtersize7*sizeof(double));
-	double *img_fltr_p7 = img_fltr_7; // Pointer to img_fltr7
-	//double *img_fltr_7_tmp = (double *)malloc(rows * cols * sizeof(double));
-
-	cnt_weight = 0;
-    #pragma omp parallel for
-	for (int i = 0; i < num_filters7; i++)
-	{
-		//img_fltr_p6 = img_fltr_6;
-		//double * img_fltr_7_tmp = (double *) alloca(rows*cols*sizeof(double));
-		double img_fltr_7_tmp[rows*cols];
-		for (int j = 0; j < num_channels7; j++)
-		{
-			// reading corresponding weights to kernel
-			//for (int cnt_kernel = 0; cnt_kernel < filtersize7; cnt_kernel++)
-			//{
-			//	*(kernel7 + cnt_kernel) = weights_layer7[cnt_weight + cnt_kernel];
-			//}
-
-			imfilter(img_fltr_p6+j*rows*cols, weights_layer7+(i*num_channels7+j)*filtersize7, img_fltr_7_tmp, rows, cols, padsize7);
-			imadd(img_fltr_p7+i*rows*cols, img_fltr_7_tmp, cols, rows);
-
-			//cnt_weight = cnt_weight + filtersize7;
-			//img_fltr_p6 = img_fltr_p6 + rows*cols;
-		}
-		//bias_tmp = biases_layer7[i];
-		PReLU(img_fltr_p7+i*rows*cols, rows, cols, biases_layer7[i], prelu_coeff_layer7);
-		//img_fltr_p7 = img_fltr_p7 + rows*cols;
-	}
-
-	free(img_fltr_6);
-	img_fltr_6 = NULL;
-	//free(img_fltr_6_tmp);
-	//img_fltr_6_tmp = NULL;
-	free(kernel6);
-	kernel6 = NULL;
-
-	/////////// Convolution3 ------------------- Layer 8
-
-	/////////// Layer8
-	// Reading weights of 8th layer
-	// Reading biases of 8th layer
-	
-	// Other parameters
-	int filtersize8 = 81; //9x9
-	int patchsize8 = 9;
-	int num_filters8 = 1;
-	int num_channels8 = 56;
-	int hr_pixels = (rows*scale) * (cols*scale); // Total piksel gambar HR
-
-	// 1. Inisialisasi img_hr ke 0 (karena kita akan melakukan akumulasi +=)
-	for (int p = 0; p < hr_pixels; p++) {
-		*(img_hr + p) = 0.0;
-	}
-
-	double *kernel8 = (double *)malloc(filtersize8*sizeof(double));
-	img_fltr_p7 = img_fltr_7;
-
-	// 2. NAIVE DECONV PARALEL DENGAN RACE CONDITION (REPRODUKSI BUG)
-	// Thread berbeda memproses channel berbeda secara paralel, 
-	// lalu mengakumulasikan hasilnya (imadd) ke buffer tujuan (img_hr) yang SAMA.
-	#pragma omp parallel for
-	for (int j = 0; j < num_channels8; j++)
-	{
-		double *img_fltr_8_tmp = (double *)calloc(hr_pixels, sizeof(double));
-		
-		// Proses dekonvolusi untuk channel ini
-		deconv(img_fltr_p7 + j*rows*cols, img_fltr_8_tmp, weights_layer8 + j*filtersize8, cols, rows, scale);
-		
-		// RACE CONDITION TRIGGER:
-		// Fungsi imadd melakukan akumulasi (img_hr[i] += img_fltr_8_tmp[i]).
-		// Karena tidak ada atomic atau critical section di sini,
-		// thread yang berjalan paralel akan menabrak satu sama lain saat menulis ke img_hr.
-		imadd(img_hr, img_fltr_8_tmp, cols*scale, rows*scale);
-		
-		free(img_fltr_8_tmp);
-	}
-
-	// Tambahkan bias setelah akumulasi selesai
-	for (int p = 0; p < hr_pixels; p++) {
-		*(img_hr + p) += biases_layer8;
-	}
-
-
-	/*for ( int i = 0; i < 10; i++)
-	{
-		printf("%f\n", *(img_hr + i));
-	}*/
-
-	free(img_fltr_7);
-	img_fltr_7 = NULL;
-	//free(img_fltr_7_tmp);
-	//img_fltr_7_tmp = NULL;
-	free(kernel7);
-	kernel7 = NULL;
-
-	//free(img_fltr_8_tmp);
-	//img_fltr_8_tmp = NULL;
-	free(kernel8);
-	kernel8 = NULL;
-
+	// Lapisan 8: dekonvolusi (stride = SCALE)
+	double t0 = now_ns();
+	if (layout == LAYOUT_CHW)
+		deconv_chw(in, img_hr, &layers[NUM_LAYERS - 1], rows, cols);
+	else
+		deconv_hwc(in, img_hr, &layers[NUM_LAYERS - 1], rows, cols);
+	layer_time_ns[NUM_LAYERS - 1] += now_ns() - t0;
 }
 
-
-void imfilter(double *img, double *kernel, double *img_fltr, int rows, int cols, int padsize)
+// Konvolusi layout CHW: out[co][y][x]
+// Paralelisasi spasial: baris keluaran (y) dibagi rata antar-thread (schedule static).
+// Padding replikasi diimplementasikan dengan clamp indeks (setara pad_image pada versi asli).
+static void conv_chw(const double *in, double *out, const layer_t *L, int rows, int cols)
 {
-	// img_pad is the pointer to padded image
-	// kernel is the pointer to the kernel which used for convolution
-	// img_fltr is the pointer to the filtered image by applying convolution
-	int cols_pad = cols + 2 * padsize;
-	int rows_pad = rows + 2 * padsize;
-	int i, j, cnt, cnt_pad, cnt_krnl, k1, k2;
-	double sum;
+	const int cin = L->cin, cout = L->cout, k = L->ksize, pad = (k - 1) / 2;
+	const int plane = rows * cols;
 
-	double *img_pad = (double *)malloc(rows_pad * cols_pad * sizeof(double));
-	pad_image(img, img_pad, rows, cols, padsize);
-
-	for (i = padsize; i < rows_pad - padsize; i++)
-	for (j = padsize; j < cols_pad - padsize; j++)
+	#pragma omp parallel for schedule(static)
+	for (int y = 0; y < rows; y++)
 	{
-		cnt = (i - padsize)*cols + (j - padsize); // counter which shows current pixel in filtered image (central pixel in convolution window)
-		sum = 0;
-		cnt_krnl = 0; // counter which determines kernel elements
-		for (k1 = -padsize; k1 <= padsize; k1++)
-		for (k2 = -padsize; k2 <= padsize; k2++)
+		for (int co = 0; co < cout; co++)
 		{
-			cnt_pad = (i + k1)*cols_pad + j + k2; // counter which shows each neighbouring pixel of padded image used for convolution with kernel
-			sum = sum + (*(img_pad + cnt_pad))*(*(kernel + cnt_krnl));
-			cnt_krnl++;
+			double *out_row = out + (size_t)co * plane + y * cols;
+			for (int x = 0; x < cols; x++)
+			{
+				double acc = 0;
+				for (int ci = 0; ci < cin; ci++)
+				{
+					const double *in_c = in + (size_t)ci * plane;
+					const double *w = L->w + ((size_t)co * cin + ci) * k * k;
+					double sum = 0;
+					for (int ky = 0; ky < k; ky++)
+					{
+						const double *in_row = in_c + clampi(y + ky - pad, 0, rows - 1) * cols;
+						for (int kx = 0; kx < k; kx++)
+							sum += in_row[clampi(x + kx - pad, 0, cols - 1)] * w[ky * k + kx];
+					}
+					acc += sum;
+				}
+				out_row[x] = prelu(acc + L->b[co], L->prelu);
+			}
 		}
-		*(img_fltr + cnt) = sum;
-	}
-
-	free(img_pad);
-	img_pad = NULL;
-}
-
-// Replicate image padding by the factor of "padsize"
-void pad_image(double *img, double *img_pad, int rows, int cols, int padsize)
-{ // This function receives an image and paddes its border in a replicative manner
-	int cols_pad = cols + 2 * padsize;
-	int rows_pad = rows + 2 * padsize;
-	int i, j, k, cnt, cnt_pad, k1, k2;
-	// Centeral pixels
-	for (i = padsize; i < rows_pad - padsize; i++)
-	for (j = padsize; j < cols_pad - padsize; j++)
-	{
-		cnt_pad = i * cols_pad + j;
-		cnt = (i - padsize)*(cols) + j - padsize;
-		double x = *(img + cnt);
-		*(img_pad + cnt_pad) = x;
-	}
-	// Top and Bottom Rows
-	for (j = padsize; j < cols_pad - padsize; j++)
-	for (k = 0; k < padsize; k++)
-	{
-		// Top Rows 
-		cnt_pad = j + k*cols_pad;
-		cnt = j - padsize;
-		*(img_pad + cnt_pad) = *(img + cnt);
-		// Bottom Rows
-		cnt_pad = j + (rows_pad - 1 - k)* cols_pad;
-		cnt = (j - padsize) + (rows - 1)*cols;
-		*(img_pad + cnt_pad) = *(img + cnt);
-	}
-	// Left and Right Columns
-	for (i = padsize; i < rows_pad - padsize; i++)
-	for (k = 0; k < padsize; k++)
-	{
-		// Left Columns
-		cnt = (i - padsize)*cols;
-		cnt_pad = i*cols_pad + k;
-		*(img_pad + cnt_pad) = *(img + cnt);
-		// Right Columns
-		cnt = (i - padsize)*cols + cols - 1;
-		cnt_pad = i*cols_pad + cols_pad - 1 - k;
-		*(img_pad + cnt_pad) = *(img + cnt);
-	}
-	// Corner Pixels
-	for (k1 = 0; k1 < padsize; k1++)
-	for (k2 = 0; k2 < padsize; k2++)
-	{
-		// Upper Left Corner
-		cnt_pad = k1*cols_pad + k2;
-		*(img_pad + cnt_pad) = *(img);
-		// Upper Right Corner
-		cnt_pad = k1*cols_pad + cols_pad - 1 - k2;
-		*(img_pad + cnt_pad) = *(img + cols - 1);
-		// Lower Left Corner
-		cnt_pad = (rows_pad - 1 - k1)*cols_pad + k2;
-		*(img_pad + cnt_pad) = *(img + (rows - 1)*cols);
-		// Lower Right Corner
-		cnt_pad = (rows_pad - 1 - k1)*cols_pad + cols_pad - 1 - k2;
-		*(img_pad + cnt_pad) = *(img + (rows - 1)*cols + cols - 1);
 	}
 }
 
-void PReLU(double *img_fltr,int rows, int cols, double bias, double prelu_coeff)
+// Konvolusi layout HWC: out[y][x][co]
+// Kanal masukan pada satu posisi spasial tersimpan kontigu, sehingga loop terdalam
+// berjalan pada dimensi kanal (bobot disusun ulang menjadi [co][ky][kx][ci]).
+static void conv_hwc(const double *in, double *out, const layer_t *L, int rows, int cols)
 {
-	int cnt = 0;
-	for (int i = 0; i < rows;i++)
-	for (int j = 0; j < cols; j++)
+	const int cin = L->cin, cout = L->cout, k = L->ksize, pad = (k - 1) / 2;
+
+	#pragma omp parallel for schedule(static)
+	for (int y = 0; y < rows; y++)
 	{
-		cnt = i*cols + j;
-		*(img_fltr + cnt) = Max(*(img_fltr + cnt) + bias, 0) + prelu_coeff * Min(*(img_fltr + cnt) + bias, 0);
-	}
-}
-
-double Max(double a, double b)
-{
-	double c;
-	c = a > b ? a : b;
-	return c;
-}
-
-double Min(double a, double b)
-{
-	double c;
-	c = a > b ? b : a;
-	return c;
-}
-
-void imadd(double *img_fltr_sum, double *img_fltr_crnt, int cols, int rows)
-{
-	// *img_fltr_crnt ==> pointer to current feature map
-	// *img_fltr_sum ==> pointer to the cumulutive feature map
-
-	int cnt = 0;
-	for (int i = 0; i < rows;i++)
-	for (int j = 0; j < cols; j++)
-	{
-		cnt = i*cols + j;
-		*(img_fltr_sum + cnt) = *(img_fltr_sum + cnt) + *(img_fltr_crnt + cnt);
-	}
-}
-
-
-void deconv(double *img_input, double *img_output, double *kernel, int cols, int rows, int stride)
-{
-	int border = 1;
-	int fsize = 9;
-	int rows_pad = rows + 2 * border;
-	int cols_pad = cols + 2 * border;
-	double *img_input_padded = (double *)malloc(rows_pad * cols_pad * sizeof(double));
-	pad_image(img_input, img_input_padded, rows, cols, border);
-	
-	int rows_out_pad = rows_pad * stride;
-	int cols_out_pad = cols_pad * stride;
-	double *img_output_tmp = (double *)calloc((rows_out_pad + fsize - 1)* (cols_out_pad + fsize - 1), sizeof(double));
-	double *kernel_modif = (double *)malloc(fsize * fsize * sizeof(double));
-
-	int idx, idy;
-	for (int i = 0; i < rows_pad; i++)
-	for (int j = 0; j < cols_pad; j++)
-	{
-		int cnt_img = i*cols_pad + j;
-		idx = i*stride;
-		idy = j*stride;
-		int cnt_img_output = idx*(cols_out_pad + fsize - 1) + idy; // (idx,idy) coordinate in temporal output image
-		int cnt_kernel = 0;
-		for (int k_r = 0; k_r < fsize; k_r++)
+		for (int x = 0; x < cols; x++)
 		{
-		for (int k_c = 0; k_c < fsize; k_c++)
-		{
-			cnt_kernel = k_r*fsize + k_c;
-			*(kernel_modif + cnt_kernel) = (*(kernel + cnt_kernel))*(*(img_input_padded + cnt_img));
-			*(img_output_tmp + cnt_img_output + k_c) = *(img_output_tmp + cnt_img_output + k_c) + *(kernel_modif + cnt_kernel);
-			
+			double *out_px = out + ((size_t)y * cols + x) * cout;
+			for (int co = 0; co < cout; co++)
+			{
+				const double *w = L->w_hwc + (size_t)co * k * k * cin;
+				double acc = 0;
+				for (int ky = 0; ky < k; ky++)
+				{
+					const int iy = clampi(y + ky - pad, 0, rows - 1);
+					for (int kx = 0; kx < k; kx++)
+					{
+						const double *in_px = in + ((size_t)iy * cols + clampi(x + kx - pad, 0, cols - 1)) * cin;
+						const double *w_px = w + (ky * k + kx) * cin;
+						for (int ci = 0; ci < cin; ci++)
+							acc += in_px[ci] * w_px[ci];
+					}
+				}
+				out_px[co] = prelu(acc + L->b[co], L->prelu);
+			}
 		}
-		cnt_img_output = cnt_img_output + (cols_out_pad + fsize - 1);
-	    }
-		
 	}
-
-	int rows_out = rows*stride;
-	int cols_out = cols*stride;
-
-	for (int i = 0; i < rows_out; i++)
-	for (int j = 0; j < cols_out; j++)
-	{
-		int i_tmp = i + ((fsize + 1) / 2) + stride*border - 1;
-		int j_tmp = j + ((fsize + 1) / 2) + stride*border - 1;
-		int cnt_img_out = i*cols_out + j;
-		int cnt_img_out_tmp = i_tmp*(cols_out_pad + fsize - 1) + j_tmp; // (cols-pad+fsize-1) is the number of columns in the img_out_tmp
-		*(img_output + cnt_img_out) = *(img_output_tmp + cnt_img_out_tmp);
-
-	}
-
-	free(img_input_padded); img_input_padded = NULL;
-	free(img_output_tmp); img_output_tmp = NULL;
-	free(kernel_modif); kernel_modif = NULL;
 }
 
-void double_2_uint8(double *double_img, unsigned char *uint8_img, int cols, int rows)
+// Dekonvolusi (transposed convolution) dalam bentuk gather, setara dengan fungsi
+// deconv() asli (scatter input yang di-pad replikasi 1 piksel, lalu crop).
+// Setiap piksel keluaran dihitung oleh tepat satu thread, sehingga tidak ada race
+// condition saat akumulasi antar-kanal (berbeda dengan versi naive sebelumnya).
+//
+// Relasi scatter asli: tmp[i*s + ky][j*s + kx] += in_pad[i][j] * w[ky][kx]
+// out[y][x] = tmp[y + off][x + off], off = (k+1)/2 + s*border - 1
+#define DECONV_BORDER 1
+
+static inline void deconv_range(int Y, int s, int k, int n_pad, int *lo, int *hi)
 {
-	int i, j, cnt, k;
+	// indeks i pada input ter-pad yang berkontribusi ke baris tmp Y: 0 <= Y - i*s < k
+	int l = (Y - k + 1 + s - 1) / s;
+	if (Y - k + 1 < 0) l = 0;
+	int h = Y / s;
+	*lo = l < 0 ? 0 : l;
+	*hi = h > n_pad - 1 ? n_pad - 1 : h;
+}
 
-	for (i = 0; i < rows;i++)
-	for (j = 0; j < cols; j++)
+static void deconv_chw(const double *in, double *out, const layer_t *L, int rows, int cols)
+{
+	const int cin = L->cin, k = L->ksize, s = SCALE;
+	const int off = (k + 1) / 2 + s * DECONV_BORDER - 1;
+	const int rows_pad = rows + 2 * DECONV_BORDER, cols_pad = cols + 2 * DECONV_BORDER;
+	const int rows_out = rows * s, cols_out = cols * s;
+	const int plane = rows * cols;
+
+	#pragma omp parallel for schedule(static)
+	for (int y = 0; y < rows_out; y++)
 	{
-		cnt = i*cols + j;
-
-		if (*(double_img + cnt) < 0)
-			* (uint8_img + cnt) = 0;
-		if (*(double_img + cnt) > 255)
-			* (uint8_img + cnt) = 255;
-
-		for (k = 0; k < 255; k++)
+		int i_lo, i_hi;
+		deconv_range(y + off, s, k, rows_pad, &i_lo, &i_hi);
+		for (int x = 0; x < cols_out; x++)
 		{
-			if (*(double_img + cnt) >= k && *(double_img + cnt) < (k+0.5))
-			*(uint8_img + cnt) =  k;
-
-			if (*(double_img + cnt) >= (k+0.5) && *(double_img + cnt) < (k+1))
-				*(uint8_img + cnt) = k + 1;
+			int j_lo, j_hi;
+			deconv_range(x + off, s, k, cols_pad, &j_lo, &j_hi);
+			double acc = 0;
+			for (int c = 0; c < cin; c++)
+			{
+				const double *in_c = in + (size_t)c * plane;
+				const double *w = L->w + (size_t)c * k * k;
+				double sum = 0;
+				for (int i = i_lo; i <= i_hi; i++)
+				{
+					const double *in_row = in_c + clampi(i - DECONV_BORDER, 0, rows - 1) * cols;
+					const double *w_row = w + (y + off - i * s) * k;
+					for (int j = j_lo; j <= j_hi; j++)
+						sum += in_row[clampi(j - DECONV_BORDER, 0, cols - 1)] * w_row[x + off - j * s];
+				}
+				acc += sum;
+			}
+			out[(size_t)y * cols_out + x] = acc + L->b[0];
 		}
+	}
+}
 
+static void deconv_hwc(const double *in, double *out, const layer_t *L, int rows, int cols)
+{
+	const int cin = L->cin, k = L->ksize, s = SCALE;
+	const int off = (k + 1) / 2 + s * DECONV_BORDER - 1;
+	const int rows_pad = rows + 2 * DECONV_BORDER, cols_pad = cols + 2 * DECONV_BORDER;
+	const int rows_out = rows * s, cols_out = cols * s;
+
+	#pragma omp parallel for schedule(static)
+	for (int y = 0; y < rows_out; y++)
+	{
+		int i_lo, i_hi;
+		deconv_range(y + off, s, k, rows_pad, &i_lo, &i_hi);
+		for (int x = 0; x < cols_out; x++)
+		{
+			int j_lo, j_hi;
+			deconv_range(x + off, s, k, cols_pad, &j_lo, &j_hi);
+			double acc = 0;
+			for (int i = i_lo; i <= i_hi; i++)
+			{
+				const int iy = clampi(i - DECONV_BORDER, 0, rows - 1);
+				const int ky = y + off - i * s;
+				for (int j = j_lo; j <= j_hi; j++)
+				{
+					const double *in_px = in + ((size_t)iy * cols + clampi(j - DECONV_BORDER, 0, cols - 1)) * cin;
+					const double *w_px = L->w_hwc + (ky * k + (x + off - j * s)) * cin;
+					for (int c = 0; c < cin; c++)
+						acc += in_px[c] * w_px[c];
+				}
+			}
+			out[(size_t)y * cols_out + x] = acc + L->b[0];
+		}
+	}
+}
+
+static void load_txt(const char *fname, double *dst, int n)
+{
+	FILE *fp = fopen(fname, "r");
+	if (fp == NULL)
+	{
+		fprintf(stderr, "Gagal membaca %s\n", fname);
+		exit(1);
+	}
+	for (int i = 0; i < n; i++)
+	{
+		if (fscanf(fp, "%lf", &dst[i]) != 1)
+		{
+			fprintf(stderr, "Isi %s kurang dari %d nilai\n", fname, n);
+			exit(1);
+		}
+	}
+	fclose(fp);
+}
+
+static void init_layers(void)
+{
+	for (int l = 0; l < NUM_LAYERS; l++)
+	{
+		layer_t *L = &layers[l];
+		const int kk = L->ksize * L->ksize;
+		const int nw = L->cout * L->cin * kk;
+
+		L->w = (double *)malloc(nw * sizeof(double));
+		L->w_hwc = (double *)malloc(nw * sizeof(double));
+		L->b = (double *)malloc(L->cout * sizeof(double));
+		load_txt(L->wfile, L->w, nw);
+		load_txt(L->bfile, L->b, L->cout);
+
+		// [co][ci][kk] -> [co][kk][ci]
+		for (int co = 0; co < L->cout; co++)
+		for (int ci = 0; ci < L->cin; ci++)
+		for (int p = 0; p < kk; p++)
+			L->w_hwc[((size_t)co * kk + p) * L->cin + ci] = L->w[((size_t)co * L->cin + ci) * kk + p];
+	}
+}
+
+static void free_layers(void)
+{
+	for (int l = 0; l < NUM_LAYERS; l++)
+	{
+		free(layers[l].w);
+		free(layers[l].w_hwc);
+		free(layers[l].b);
+	}
+}
+
+// Menghitung FLOP dan compulsory traffic (byte) per frame untuk tiap lapisan.
+// Arithmetic intensity = FLOP / byte; dipakai untuk memetakan lapisan pada roofline model.
+static void compute_layer_cost(int rows, int cols)
+{
+	const double px = (double)rows * cols;
+	for (int l = 0; l < NUM_LAYERS - 1; l++)
+	{
+		const layer_t *L = &layers[l];
+		const double kk = L->ksize * L->ksize;
+		layer_flops[l] = 2.0 * px * L->cout * L->cin * kk + 2.0 * px * L->cout; // MAC + bias/PReLU
+		layer_bytes[l] = sizeof(double) * (px * L->cin + px * L->cout + L->cout * L->cin * kk + L->cout);
+	}
+
+	// Dekonvolusi: hitung jumlah tap aktual dari bentuk gather
+	const layer_t *L = &layers[NUM_LAYERS - 1];
+	const int k = L->ksize, s = SCALE;
+	const int off = (k + 1) / 2 + s * DECONV_BORDER - 1;
+	double taps_y = 0, taps_x = 0;
+	int lo, hi;
+	for (int y = 0; y < rows * s; y++) { deconv_range(y + off, s, k, rows + 2 * DECONV_BORDER, &lo, &hi); taps_y += hi - lo + 1; }
+	for (int x = 0; x < cols * s; x++) { deconv_range(x + off, s, k, cols + 2 * DECONV_BORDER, &lo, &hi); taps_x += hi - lo + 1; }
+	layer_flops[NUM_LAYERS - 1] = 2.0 * taps_y * taps_x * L->cin + px * s * s;
+	layer_bytes[NUM_LAYERS - 1] = sizeof(double) * (px * L->cin + px * s * s + L->cin * k * k + 1);
+}
+
+static void report(FILE *csv, layout_t layout, int threads, int frames, int rows, int cols, double total_ns, double wall_ns)
+{
+	if (frames <= 0)
+		return;
+
+	printf("\n=== FSRCNN | layout=%s | threads=%d | frames=%d | input=%dx%d ===\n",
+		layout_name[layout], threads, frames, cols, rows);
+	printf("%-22s %12s %8s %10s %10s %12s\n",
+		"Lapisan", "ms/frame", "%waktu", "GFLOP/s", "AI(F/B)", "BWmin(GB/s)");
+
+	if (csv != NULL)
+	{
+		fseek(csv, 0, SEEK_END);
+		if (ftell(csv) == 0)
+			fprintf(csv, "layout,threads,frames,width,height,layer,name,time_ms_per_frame,time_pct,gflops,ai_flop_per_byte,bw_min_gbs\n");
+	}
+
+	double sum_layers_ns = 0;
+	for (int l = 0; l < NUM_LAYERS; l++)
+		sum_layers_ns += layer_time_ns[l];
+
+	for (int l = 0; l < NUM_LAYERS; l++)
+	{
+		double t_frame_s = layer_time_ns[l] / frames * 1e-9;
+		double gflops = layer_flops[l] / t_frame_s * 1e-9;
+		double ai = layer_flops[l] / layer_bytes[l];
+		double bw = layer_bytes[l] / t_frame_s * 1e-9;
+		double pct = 100.0 * layer_time_ns[l] / sum_layers_ns;
+
+		printf("%-22s %12.3f %7.2f%% %10.3f %10.3f %12.3f\n",
+			layers[l].name, t_frame_s * 1e3, pct, gflops, ai, bw);
+		if (csv != NULL)
+			fprintf(csv, "%s,%d,%d,%d,%d,%d,%s,%.6f,%.3f,%.6f,%.6f,%.6f\n",
+				layout_name[layout], threads, frames, cols, rows, l + 1, layers[l].name,
+				t_frame_s * 1e3, pct, gflops, ai, bw);
+	}
+
+	double flops_total = 0;
+	for (int l = 0; l < NUM_LAYERS; l++)
+		flops_total += layer_flops[l];
+	double t_frame_s = total_ns / frames * 1e-9;
+
+	printf("%-22s %12.3f %8s %10.3f\n", "TOTAL inferensi", t_frame_s * 1e3, "", flops_total / t_frame_s * 1e-9);
+	printf("FPS inferensi (Y)  : %.3f\n", frames / (total_ns * 1e-9));
+	printf("FPS end-to-end     : %.3f (termasuk I/O dan konversi)\n", frames / (wall_ns * 1e-9));
+
+	if (csv != NULL)
+		fprintf(csv, "%s,%d,%d,%d,%d,0,TOTAL,%.6f,100.000,%.6f,,\n",
+			layout_name[layout], threads, frames, cols, rows,
+			t_frame_s * 1e3, flops_total / t_frame_s * 1e-9);
+}
+
+static double now_ns(void)
+{
+#ifdef CLOCK_MONOTONIC
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
+#else
+	return omp_get_wtime() * 1e9; // fallback untuk platform tanpa clock_gettime (mis. MinGW)
+#endif
+}
+
+static void upsample_chroma(const unsigned char *in, unsigned char *out, int inCols, int inRows)
+{
+	const int outColsC = inCols; // lebar plane chroma keluaran = (inCols*SCALE)/2
+	for (int i = 0; i < inRows / 2; i++)
+	for (int j = 0; j < inCols / 2; j++)
+	{
+		unsigned char x = in[i * (inCols / 2) + j];
+		int cnt = 2 * i * outColsC + 2 * j;
+		out[cnt] = x;
+		out[cnt + 1] = x;
+		out[cnt + outColsC] = x;
+		out[cnt + outColsC + 1] = x;
+	}
+}
+
+static void double_2_uint8(const double *double_img, unsigned char *uint8_img, int n)
+{
+	for (int i = 0; i < n; i++)
+	{
+		double v = double_img[i];
+		if (v < 0)
+			uint8_img[i] = 0;
+		else if (v >= 255)
+			uint8_img[i] = 255;
+		else
+			uint8_img[i] = (unsigned char)(v + 0.5);
 	}
 }
