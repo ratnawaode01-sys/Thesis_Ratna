@@ -6,11 +6,13 @@
 //    Tekanan Bandwidth Memori dan Efisiensi Inferensi Layer FSRCNN Berkanal Kecil
 //    pada CPU Multi-Core" - Wa Ode Ratna Adiningsih (D082252009)
 //
-// Variabel bebas (parameter program):
-//   1. Layout feature map : CHW atau HWC (dipakai di seluruh 8 lapisan)
-//   2. Jumlah thread      : 1, 2, 4, 8 (paralelisasi OpenMP pada dimensi spasial,
-//                           yaitu baris (tinggi) feature map keluaran)
-// Satu modul yang sama dipakai untuk semua skenario; yang berbeda hanya parameternya.
+// USULAN: layout feature map HWC + paralelisasi spasial.
+//   - Layout HWC  : seluruh kanal pada satu posisi spasial tersimpan kontigu,
+//                   out[y][x][c], dipakai di seluruh 8 lapisan.
+//   - Paralelisasi: OpenMP pada dimensi spasial, yaitu baris (tinggi) feature map
+//                   keluaran dibagi rata antar-thread (1, 2, 4, 8 thread).
+// Pembanding (baseline) adalah fsrcnn_naive_openmp_old.c: layout CHW dengan
+// paralelisasi per kanal/filter.
 //
 // Keluaran pengukuran (per lapisan, dengan resolusi nanodetik via clock_gettime):
 //   - waktu eksekusi (efisiensi inferensi) dan throughput (GFLOP/s, FPS)
@@ -18,12 +20,11 @@
 //     (compulsory traffic / waktu) sebagai proksi tekanan bandwidth memori
 // Cache miss dan bandwidth DRAM aktual diukur dari luar (non-intrusif) dengan perf, mis.:
 //   perf stat -e cycles,instructions,L1-dcache-load-misses,LLC-load-misses,LLC-loads
-//     ./fsrcnn_naive_openmp in.yuv out.yuv 150 hwc 4
+//     ./fsrcnn_naive_openmp in.yuv out.yuv 150 4
 //
 // Kompilasi : gcc -O3 -fopenmp -o fsrcnn_naive_openmp fsrcnn_naive_openmp.c -lm
-// Pemakaian : ./fsrcnn_naive_openmp <in.yuv> <out.yuv> [frames] [chw|hwc] [threads] [csv] [width] [height]
+// Pemakaian : ./fsrcnn_naive_openmp <in.yuv> <out.yuv> [frames] [threads] [csv] [width] [height]
 //   frames  : default 150
-//   layout  : default chw
 //   threads : default OMP_NUM_THREADS / omp_get_max_threads()
 //   csv     : file CSV untuk ditambahkan hasil per lapisan (opsional, "-" = tidak ada)
 //   width, height : resolusi input, default 176x144 (QCIF)
@@ -39,10 +40,6 @@
 #define SCALE      2
 #define NUM_LAYERS 8
 
-typedef enum { LAYOUT_CHW = 0, LAYOUT_HWC = 1 } layout_t;
-
-static const char *layout_name[] = { "CHW", "HWC" };
-
 // Konfigurasi lapisan FSRCNN (56,12,4): feature extraction, shrinking, mapping x4, expanding, deconvolution
 typedef struct
 {
@@ -53,8 +50,7 @@ typedef struct
 	double prelu;      // koefisien PReLU
 	const char *wfile;
 	const char *bfile;
-	double *w;         // bobot asli: [cout][cin][ky][kx] (deconv: [cin][ky][kx])
-	double *w_hwc;     // bobot tersusun ulang untuk HWC: [cout][ky][kx][cin] (deconv: [ky][kx][cin])
+	double *w;         // bobot tersusun untuk HWC: [cout][ky][kx][cin] (deconv: [ky][kx][cin])
 	double *b;
 } layer_t;
 
@@ -80,14 +76,12 @@ static void free_layers(void);
 static void compute_layer_cost(int rows, int cols);
 static double now_ns(void);
 
-static void FSRCNN(double *img_hr, const double *img_lr, double **fmap, int rows, int cols, layout_t layout);
-static void conv_chw(const double *in, double *out, const layer_t *L, int rows, int cols);
+static void FSRCNN(double *img_hr, const double *img_lr, double **fmap, int rows, int cols);
 static void conv_hwc(const double *in, double *out, const layer_t *L, int rows, int cols);
-static void deconv_chw(const double *in, double *out, const layer_t *L, int rows, int cols);
 static void deconv_hwc(const double *in, double *out, const layer_t *L, int rows, int cols);
 static void double_2_uint8(const double *double_img, unsigned char *uint8_img, int n);
 static void upsample_chroma(const unsigned char *in, unsigned char *out, int inCols, int inRows);
-static void report(FILE *csv, layout_t layout, int threads, int frames, int rows, int cols, double total_ns, double wall_ns);
+static void report(FILE *csv, int threads, int frames, int rows, int cols, double total_ns, double wall_ns);
 
 static inline int clampi(int v, int lo, int hi)
 {
@@ -103,20 +97,17 @@ int main(int argc, char *argv[])
 {
 	if (argc < 3)
 	{
-		fprintf(stderr, "Pemakaian: %s <in.yuv> <out.yuv> [frames] [chw|hwc] [threads] [csv] [width] [height]\n", argv[0]);
+		fprintf(stderr, "Pemakaian: %s <in.yuv> <out.yuv> [frames] [threads] [csv] [width] [height]\n", argv[0]);
 		return 1;
 	}
 
 	char *inFile = argv[1];
 	char *outFile = argv[2];
 	int num = (argc > 3) ? atoi(argv[3]) : 150;                    // Jumlah frame
-	layout_t layout = LAYOUT_CHW;
-	if (argc > 4 && (strcmp(argv[4], "hwc") == 0 || strcmp(argv[4], "HWC") == 0))
-		layout = LAYOUT_HWC;
-	int threads = (argc > 5) ? atoi(argv[5]) : omp_get_max_threads();
-	const char *csvFile = (argc > 6 && strcmp(argv[6], "-") != 0) ? argv[6] : NULL;
-	int inCols = (argc > 7) ? atoi(argv[7]) : 176;                // Lebar video input
-	int inRows = (argc > 8) ? atoi(argv[8]) : 144;                // Tinggi video input
+	int threads = (argc > 4) ? atoi(argv[4]) : omp_get_max_threads();
+	const char *csvFile = (argc > 5 && strcmp(argv[5], "-") != 0) ? argv[5] : NULL;
+	int inCols = (argc > 6) ? atoi(argv[6]) : 176;                // Lebar video input
+	int inRows = (argc > 7) ? atoi(argv[7]) : 144;                // Tinggi video input
 
 	if (num <= 0 || threads <= 0 || inCols <= 0 || inRows <= 0)
 	{
@@ -163,7 +154,7 @@ int main(int argc, char *argv[])
 			inBuf_tmp[i] = inBuf[i] / 255.0;
 
 		double t0 = now_ns();
-		FSRCNN(outBuf_tmp, inBuf_tmp, fmap, inRows, inCols, layout);
+		FSRCNN(outBuf_tmp, inBuf_tmp, fmap, inRows, inCols);
 		total_ns += now_ns() - t0;
 
 		for (int i = 0; i < outCols * outRows; i++)
@@ -191,9 +182,11 @@ int main(int argc, char *argv[])
 		if (csv == NULL)
 			fprintf(stderr, "Gagal membuka CSV %s\n", csvFile);
 	}
-	report(csv, layout, threads, num, inRows, inCols, total_ns, wall_ns);
+	report(csv, threads, num, inRows, inCols, total_ns, wall_ns);
 	if (csv != NULL)
 		fclose(csv);
+	// Format sama dengan fsrcnn_naive_openmp_old.c, dibaca oleh comparison_ratna.sh
+	printf("INFERENCE_MS=%.3f\n", total_ns * 1e-6);
 
 	fclose(inFp);
 	fclose(outFp);
@@ -207,69 +200,29 @@ int main(int argc, char *argv[])
 	return 0;
 }
 
-static void FSRCNN(double *img_hr, const double *img_lr, double **fmap, int rows, int cols, layout_t layout)
+static void FSRCNN(double *img_hr, const double *img_lr, double **fmap, int rows, int cols)
 {
-	// Lapisan 1-7: konvolusi + PReLU. Input lapisan 1 hanya satu kanal sehingga CHW == HWC.
+	// Lapisan 1-7: konvolusi + PReLU. Input lapisan 1 hanya satu kanal (citra Y).
 	const double *in = img_lr;
 	for (int l = 0; l < NUM_LAYERS - 1; l++)
 	{
 		double t0 = now_ns();
-		if (layout == LAYOUT_CHW)
-			conv_chw(in, fmap[l], &layers[l], rows, cols);
-		else
-			conv_hwc(in, fmap[l], &layers[l], rows, cols);
+		conv_hwc(in, fmap[l], &layers[l], rows, cols);
 		layer_time_ns[l] += now_ns() - t0;
 		in = fmap[l];
 	}
 
 	// Lapisan 8: dekonvolusi (stride = SCALE)
 	double t0 = now_ns();
-	if (layout == LAYOUT_CHW)
-		deconv_chw(in, img_hr, &layers[NUM_LAYERS - 1], rows, cols);
-	else
-		deconv_hwc(in, img_hr, &layers[NUM_LAYERS - 1], rows, cols);
+	deconv_hwc(in, img_hr, &layers[NUM_LAYERS - 1], rows, cols);
 	layer_time_ns[NUM_LAYERS - 1] += now_ns() - t0;
 }
 
-// Konvolusi layout CHW: out[co][y][x]
-// Paralelisasi spasial: baris keluaran (y) dibagi rata antar-thread (schedule static).
-// Padding replikasi diimplementasikan dengan clamp indeks (setara pad_image pada versi asli).
-static void conv_chw(const double *in, double *out, const layer_t *L, int rows, int cols)
-{
-	const int cin = L->cin, cout = L->cout, k = L->ksize, pad = (k - 1) / 2;
-	const int plane = rows * cols;
-
-	#pragma omp parallel for schedule(static)
-	for (int y = 0; y < rows; y++)
-	{
-		for (int co = 0; co < cout; co++)
-		{
-			double *out_row = out + (size_t)co * plane + y * cols;
-			for (int x = 0; x < cols; x++)
-			{
-				double acc = 0;
-				for (int ci = 0; ci < cin; ci++)
-				{
-					const double *in_c = in + (size_t)ci * plane;
-					const double *w = L->w + ((size_t)co * cin + ci) * k * k;
-					double sum = 0;
-					for (int ky = 0; ky < k; ky++)
-					{
-						const double *in_row = in_c + clampi(y + ky - pad, 0, rows - 1) * cols;
-						for (int kx = 0; kx < k; kx++)
-							sum += in_row[clampi(x + kx - pad, 0, cols - 1)] * w[ky * k + kx];
-					}
-					acc += sum;
-				}
-				out_row[x] = prelu(acc + L->b[co], L->prelu);
-			}
-		}
-	}
-}
-
 // Konvolusi layout HWC: out[y][x][co]
+// Paralelisasi spasial: baris keluaran (y) dibagi rata antar-thread (schedule static).
 // Kanal masukan pada satu posisi spasial tersimpan kontigu, sehingga loop terdalam
-// berjalan pada dimensi kanal (bobot disusun ulang menjadi [co][ky][kx][ci]).
+// berjalan pada dimensi kanal (bobot disusun [co][ky][kx][ci]).
+// Padding replikasi diimplementasikan dengan clamp indeks (setara pad_image pada versi asli).
 static void conv_hwc(const double *in, double *out, const layer_t *L, int rows, int cols)
 {
 	const int cin = L->cin, cout = L->cout, k = L->ksize, pad = (k - 1) / 2;
@@ -282,7 +235,7 @@ static void conv_hwc(const double *in, double *out, const layer_t *L, int rows, 
 			double *out_px = out + ((size_t)y * cols + x) * cout;
 			for (int co = 0; co < cout; co++)
 			{
-				const double *w = L->w_hwc + (size_t)co * k * k * cin;
+				const double *w = L->w + (size_t)co * k * k * cin;
 				double acc = 0;
 				for (int ky = 0; ky < k; ky++)
 				{
@@ -304,7 +257,7 @@ static void conv_hwc(const double *in, double *out, const layer_t *L, int rows, 
 // Dekonvolusi (transposed convolution) dalam bentuk gather, setara dengan fungsi
 // deconv() asli (scatter input yang di-pad replikasi 1 piksel, lalu crop).
 // Setiap piksel keluaran dihitung oleh tepat satu thread, sehingga tidak ada race
-// condition saat akumulasi antar-kanal (berbeda dengan versi naive sebelumnya).
+// condition saat akumulasi antar-kanal (berbeda dengan versi naif sebelumnya).
 //
 // Relasi scatter asli: tmp[i*s + ky][j*s + kx] += in_pad[i][j] * w[ky][kx]
 // out[y][x] = tmp[y + off][x + off], off = (k+1)/2 + s*border - 1
@@ -318,43 +271,6 @@ static inline void deconv_range(int Y, int s, int k, int n_pad, int *lo, int *hi
 	int h = Y / s;
 	*lo = l < 0 ? 0 : l;
 	*hi = h > n_pad - 1 ? n_pad - 1 : h;
-}
-
-static void deconv_chw(const double *in, double *out, const layer_t *L, int rows, int cols)
-{
-	const int cin = L->cin, k = L->ksize, s = SCALE;
-	const int off = (k + 1) / 2 + s * DECONV_BORDER - 1;
-	const int rows_pad = rows + 2 * DECONV_BORDER, cols_pad = cols + 2 * DECONV_BORDER;
-	const int rows_out = rows * s, cols_out = cols * s;
-	const int plane = rows * cols;
-
-	#pragma omp parallel for schedule(static)
-	for (int y = 0; y < rows_out; y++)
-	{
-		int i_lo, i_hi;
-		deconv_range(y + off, s, k, rows_pad, &i_lo, &i_hi);
-		for (int x = 0; x < cols_out; x++)
-		{
-			int j_lo, j_hi;
-			deconv_range(x + off, s, k, cols_pad, &j_lo, &j_hi);
-			double acc = 0;
-			for (int c = 0; c < cin; c++)
-			{
-				const double *in_c = in + (size_t)c * plane;
-				const double *w = L->w + (size_t)c * k * k;
-				double sum = 0;
-				for (int i = i_lo; i <= i_hi; i++)
-				{
-					const double *in_row = in_c + clampi(i - DECONV_BORDER, 0, rows - 1) * cols;
-					const double *w_row = w + (y + off - i * s) * k;
-					for (int j = j_lo; j <= j_hi; j++)
-						sum += in_row[clampi(j - DECONV_BORDER, 0, cols - 1)] * w_row[x + off - j * s];
-				}
-				acc += sum;
-			}
-			out[(size_t)y * cols_out + x] = acc + L->b[0];
-		}
-	}
 }
 
 static void deconv_hwc(const double *in, double *out, const layer_t *L, int rows, int cols)
@@ -381,7 +297,7 @@ static void deconv_hwc(const double *in, double *out, const layer_t *L, int rows
 				for (int j = j_lo; j <= j_hi; j++)
 				{
 					const double *in_px = in + ((size_t)iy * cols + clampi(j - DECONV_BORDER, 0, cols - 1)) * cin;
-					const double *w_px = L->w_hwc + (ky * k + (x + off - j * s)) * cin;
+					const double *w_px = L->w + (ky * k + (x + off - j * s)) * cin;
 					for (int c = 0; c < cin; c++)
 						acc += in_px[c] * w_px[c];
 				}
@@ -418,17 +334,18 @@ static void init_layers(void)
 		const int kk = L->ksize * L->ksize;
 		const int nw = L->cout * L->cin * kk;
 
+		// File bobot tersimpan [co][ci][ky][kx]; disusun ulang menjadi [co][ky][kx][ci]
+		double *w_file = (double *)malloc(nw * sizeof(double));
 		L->w = (double *)malloc(nw * sizeof(double));
-		L->w_hwc = (double *)malloc(nw * sizeof(double));
 		L->b = (double *)malloc(L->cout * sizeof(double));
-		load_txt(L->wfile, L->w, nw);
+		load_txt(L->wfile, w_file, nw);
 		load_txt(L->bfile, L->b, L->cout);
 
-		// [co][ci][kk] -> [co][kk][ci]
 		for (int co = 0; co < L->cout; co++)
 		for (int ci = 0; ci < L->cin; ci++)
 		for (int p = 0; p < kk; p++)
-			L->w_hwc[((size_t)co * kk + p) * L->cin + ci] = L->w[((size_t)co * L->cin + ci) * kk + p];
+			L->w[((size_t)co * kk + p) * L->cin + ci] = w_file[((size_t)co * L->cin + ci) * kk + p];
+		free(w_file);
 	}
 }
 
@@ -437,7 +354,6 @@ static void free_layers(void)
 	for (int l = 0; l < NUM_LAYERS; l++)
 	{
 		free(layers[l].w);
-		free(layers[l].w_hwc);
 		free(layers[l].b);
 	}
 }
@@ -467,13 +383,13 @@ static void compute_layer_cost(int rows, int cols)
 	layer_bytes[NUM_LAYERS - 1] = sizeof(double) * (px * L->cin + px * s * s + L->cin * k * k + 1);
 }
 
-static void report(FILE *csv, layout_t layout, int threads, int frames, int rows, int cols, double total_ns, double wall_ns)
+static void report(FILE *csv, int threads, int frames, int rows, int cols, double total_ns, double wall_ns)
 {
 	if (frames <= 0)
 		return;
 
-	printf("\n=== FSRCNN | layout=%s | threads=%d | frames=%d | input=%dx%d ===\n",
-		layout_name[layout], threads, frames, cols, rows);
+	printf("\n=== FSRCNN usulan | layout=HWC | threads=%d | frames=%d | input=%dx%d ===\n",
+		threads, frames, cols, rows);
 	printf("%-22s %12s %8s %10s %10s %12s\n",
 		"Lapisan", "ms/frame", "%waktu", "GFLOP/s", "AI(F/B)", "BWmin(GB/s)");
 
@@ -499,8 +415,8 @@ static void report(FILE *csv, layout_t layout, int threads, int frames, int rows
 		printf("%-22s %12.3f %7.2f%% %10.3f %10.3f %12.3f\n",
 			layers[l].name, t_frame_s * 1e3, pct, gflops, ai, bw);
 		if (csv != NULL)
-			fprintf(csv, "%s,%d,%d,%d,%d,%d,%s,%.6f,%.3f,%.6f,%.6f,%.6f\n",
-				layout_name[layout], threads, frames, cols, rows, l + 1, layers[l].name,
+			fprintf(csv, "HWC,%d,%d,%d,%d,%d,%s,%.6f,%.3f,%.6f,%.6f,%.6f\n",
+				threads, frames, cols, rows, l + 1, layers[l].name,
 				t_frame_s * 1e3, pct, gflops, ai, bw);
 	}
 
@@ -514,8 +430,8 @@ static void report(FILE *csv, layout_t layout, int threads, int frames, int rows
 	printf("FPS end-to-end     : %.3f (termasuk I/O dan konversi)\n", frames / (wall_ns * 1e-9));
 
 	if (csv != NULL)
-		fprintf(csv, "%s,%d,%d,%d,%d,0,TOTAL,%.6f,100.000,%.6f,,\n",
-			layout_name[layout], threads, frames, cols, rows,
+		fprintf(csv, "HWC,%d,%d,%d,%d,0,TOTAL,%.6f,100.000,%.6f,,\n",
+			threads, frames, cols, rows,
 			t_frame_s * 1e3, flops_total / t_frame_s * 1e-9);
 }
 

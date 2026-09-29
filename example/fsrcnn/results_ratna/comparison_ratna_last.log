@@ -1,0 +1,14 @@
+=============================================================================
+                          KOMPILASI EXECUTABLE
+=============================================================================
+Using compiler: gcc
+C:/Users/ratna/OneDrive/Documents/S2/Semester 2/Proposal/sync-pilot-main/example/fsrcnn/fsrcnn_serial.c: In function 'main':
+C:/Users/ratna/OneDrive/Documents/S2/Semester 2/Proposal/sync-pilot-main/example/fsrcnn/fsrcnn_serial.c:132:5: warning: implicit declaration of function 'mkdir' [-Wimplicit-function-declaration]
+     mkdir("logs", 0777);
+     ^~~~~
+Kompilasi selesai.
+
+ERROR: taskset tidak ditemukan (paket util-linux). Dibutuhkan untuk pinning core.
+
+Script berhenti dengan error (kode 1). Lihat pesan di atas atau log: /c/Users/ratna/OneDrive/Documents/S2/Semester 2/Proposal/sync-pilot-main/example/fsrcnn/results_ratna/comparison_ratna_last.log
+Tekan Enter untuk menutup jendela...
