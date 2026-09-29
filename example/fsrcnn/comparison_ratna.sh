@@ -12,21 +12,27 @@
 # program), tidak termasuk start/tutup proses, baca bobot, dan buka/tutup/baca/tulis file.
 # Waktu proses total tetap dicatat di raw_timings.csv (kolom process_wall_ms).
 #
-# Setiap program dijalankan dengan kombinasi:
-#   Jumlah thread : 1, 2, 4, 8
-#   Himpunan core : LITTLE saja, BIG saja, BIG+LITTLE (gabungan)
-# Core di-pin dengan taskset; thread OpenMP mewarisi mask CPU tersebut.
-# Pada himpunan 4 core, 8 thread berarti oversubscription (2 thread/core).
+# Skenario percobaan (jumlah thread pada LITTLE core dan BIG core):
+#   Satu jenis core : 1 LITTLE, 1 BIG, 5 LITTLE, 5 BIG, 10 LITTLE, 10 BIG
+#   Gabungan        : 5 LITTLE + 5 BIG, 10 LITTLE + 10 BIG
+# Skenario ditulis sebagai token "<n>L", "<n>B", atau "<n>L+<n>B".
+#
+# Pinning:
+#   Proses di-pin dengan taskset ke himpunan core skenario, lalu tiap thread OpenMP
+#   di-pin ke satu CPU tetap dengan GOMP_CPU_AFFINITY (thread dibagi bergiliran ke core
+#   pada jenisnya). Jadi 2 thread memakai tepat 2 CPU, dan pada skenario gabungan tepat
+#   <n> thread berjalan di LITTLE dan <n> thread di BIG.
+#   Jika jumlah thread melebihi jumlah core pada jenis tersebut, terjadi oversubscription
+#   (mis. 5 thread pada 4 core LITTLE).
 #
 # Usage:
 #   bash comparison_ratna.sh              # build lalu jalankan benchmark penuh
 #   bash comparison_ratna.sh --build-only # hanya build executable
 #
-# Env opsional (contoh: NUM_RUNS=3 THREAD_LIST="1 4" bash comparison_ratna.sh):
+# Env opsional (contoh: NUM_RUNS=3 SCENARIO_LIST="1L 1B 5L+5B" bash comparison_ratna.sh):
 #   TOTAL_FRAMES=150              jumlah frame yang diproses
 #   NUM_RUNS=5                    run per skenario (run 1 = cold-start, tidak dirata-rata)
-#   THREAD_LIST="1 2 4 8"         jumlah thread yang diuji
-#   CORESET_LIST="little big all" himpunan core yang diuji
+#   SCENARIO_LIST="1L 1B 5L 5B 10L 10B 5L+5B 10L+10B"   skenario yang diuji
 #   PROGRAM_LIST="NAIVE HWC"      program yang diuji
 #   BIG_CPUS=4-7 LITTLE_CPUS=0-3  override deteksi otomatis big/little core
 #   COOLDOWN=10                   jeda (detik) antar skenario
@@ -63,8 +69,7 @@ KEEP_OUTPUT="${KEEP_OUTPUT:-0}"
 PERF="${PERF:-0}"
 PERF_EVENTS="${PERF_EVENTS:-task-clock,cycles,instructions,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses}"
 
-read -r -a THREAD_LIST <<< "${THREAD_LIST:-1 2 4 8}"
-read -r -a CORESET_LIST <<< "${CORESET_LIST:-little big all}"
+read -r -a SCENARIO_LIST <<< "${SCENARIO_LIST:-1L 1B 5L 5B 10L 10B 5L+5B 10L+10B}"
 read -r -a PROGRAM_LIST <<< "${PROGRAM_LIST:-NAIVE HWC}"
 
 EXPECTED_OUTPUT_SIZE=$((OUT_WIDTH * OUT_HEIGHT * 3 / 2 * TOTAL_FRAMES))
@@ -155,19 +160,26 @@ join_cpus() {
     echo "$*"
 }
 
-# Hitung jumlah CPU dari format taskset (mis. "0-3,6" -> 5)
-count_cpus() {
-    local list="$1" n=0 part a b
+# Uraikan format taskset menjadi daftar CPU satu per satu (mis. "0-2,6" -> "0 1 2 6")
+expand_cpus() {
+    local list="$1" part a b out=()
     IFS=, read -r -a parts <<< "$list"
     for part in "${parts[@]}"; do
         if [[ "$part" == *-* ]]; then
             a="${part%-*}"; b="${part#*-}"
-            n=$((n + b - a + 1))
+            out+=($(seq "$a" "$b"))
         else
-            n=$((n + 1))
+            out+=("$part")
         fi
     done
-    echo "$n"
+    echo "${out[*]}"
+}
+
+# Hitung jumlah CPU dari format taskset (mis. "0-3,6" -> 5)
+count_cpus() {
+    local -a c
+    read -r -a c <<< "$(expand_cpus "$1")"
+    echo "${#c[@]}"
 }
 
 # Deteksi big/little core dari cpuinfo_max_freq (RK3588S: A55 = little, A76 = big)
@@ -202,30 +214,65 @@ detect_cores() {
 
     DETECTED_BIG=$(join_cpus "${big[@]}")
     DETECTED_LITTLE=$(join_cpus "${little[@]}")
-    DETECTED_ALL=$(join_cpus "${all[@]}")
 }
 
 detect_cores
 BIG_CPUS="${BIG_CPUS:-$DETECTED_BIG}"
 LITTLE_CPUS="${LITTLE_CPUS:-$DETECTED_LITTLE}"
-ALL_CPUS="${ALL_CPUS:-$DETECTED_ALL}"
+N_LITTLE=$(count_cpus "$LITTLE_CPUS")
+N_BIG=$(count_cpus "$BIG_CPUS")
 
-coreset_cpus() {
-    case "$1" in
-        little) echo "$LITTLE_CPUS" ;;
-        big)    echo "$BIG_CPUS" ;;
-        all)    echo "$ALL_CPUS" ;;
-        *)      echo "" ;;
-    esac
+# Uraikan token skenario ("5L", "10B", "5L+5B") menjadi SC_L (thread LITTLE) dan
+# SC_B (thread BIG). Mengembalikan status 1 jika token tidak valid.
+parse_scenario() {
+    local tok="$1" part
+    SC_L=0; SC_B=0
+    IFS=+ read -r -a parts <<< "$tok"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            *[0-9]L) SC_L=$((SC_L + ${part%L})) ;;
+            *[0-9]B) SC_B=$((SC_B + ${part%B})) ;;
+            *)       return 1 ;;
+        esac
+    done
+    [ $((SC_L + SC_B)) -gt 0 ]
 }
 
-coreset_label() {
-    case "$1" in
-        little) echo "LITTLE" ;;
-        big)    echo "BIG" ;;
-        all)    echo "BIG+LITTLE" ;;
-        *)      echo "$1" ;;
-    esac
+scenario_label() {
+    parse_scenario "$1" || { echo "$1"; return; }
+    if [ "$SC_L" -gt 0 ] && [ "$SC_B" -gt 0 ]; then
+        echo "${SC_L} LITTLE + ${SC_B} BIG"
+    elif [ "$SC_L" -gt 0 ]; then
+        echo "${SC_L} LITTLE"
+    else
+        echo "${SC_B} BIG"
+    fi
+}
+
+# Mask taskset untuk skenario
+scenario_cpus() {
+    parse_scenario "$1" || { echo ""; return; }
+    if [ "$SC_L" -gt 0 ] && [ "$SC_B" -gt 0 ]; then
+        echo "${LITTLE_CPUS},${BIG_CPUS}"
+    elif [ "$SC_L" -gt 0 ]; then
+        echo "$LITTLE_CPUS"
+    else
+        echo "$BIG_CPUS"
+    fi
+}
+
+# GOMP_CPU_AFFINITY: thread 0..L-1 bergiliran di core LITTLE, thread L..L+B-1 bergiliran
+# di core BIG. Dipakai di semua skenario supaya tiap thread menempel di satu CPU tetap
+# (tanpa ini, mis. 2 thread pada mask 4 CPU berpindah-pindah dan terlihat memakai 4 CPU).
+scenario_affinity() {
+    parse_scenario "$1" || { echo ""; return; }
+    local -a lc bc out=()
+    local i
+    read -r -a lc <<< "$(expand_cpus "$LITTLE_CPUS")"
+    read -r -a bc <<< "$(expand_cpus "$BIG_CPUS")"
+    for ((i=0; i<SC_L; i++)); do out+=("${lc[$((i % ${#lc[@]}))]}"); done
+    for ((i=0; i<SC_B; i++)); do out+=("${bc[$((i % ${#bc[@]}))]}"); done
+    echo "${out[*]}"
 }
 
 program_label() {
@@ -236,9 +283,9 @@ program_label() {
     esac
 }
 
-# run_program <program> <threads> <cpus> <output.yuv> <layer_csv> <perf_file> <stdout_file>
+# run_program <program> <threads> <cpus> <affinity> <output.yuv> <layer_csv> <perf_file> <stdout_file>
 run_program() {
-    local prog="$1" threads="$2" cpus="$3" out="$4" layer_csv="$5" perf_file="$6" stdout_file="$7"
+    local prog="$1" threads="$2" cpus="$3" affinity="$4" out="$5" layer_csv="$6" perf_file="$7" stdout_file="$8"
     local -a cmd
 
     case "$prog" in
@@ -251,8 +298,17 @@ run_program() {
         cmd=(perf stat -x, -o "$perf_file" -e "$PERF_EVENTS" -- "${cmd[@]}")
     fi
 
-    OMP_NUM_THREADS="$threads" OMP_DYNAMIC=false taskset -c "$cpus" "${cmd[@]}" > "$stdout_file" 2>&1
+    GOMP_CPU_AFFINITY="$affinity" OMP_NUM_THREADS="$threads" OMP_DYNAMIC=false \
+        taskset -c "$cpus" "${cmd[@]}" > "$stdout_file" 2>&1
 }
+
+# Validasi token skenario lebih awal supaya salah ketik tidak baru ketahuan di tengah benchmark
+for sc in "${SCENARIO_LIST[@]}"; do
+    if ! parse_scenario "$sc"; then
+        echo "ERROR: skenario '${sc}' tidak valid (format: <n>L, <n>B, atau <n>L+<n>B)."
+        exit 1
+    fi
+done
 
 # ===================== GROUND TRUTH =====================
 # Ground truth dari fsrcnn_serial (single-thread, deterministik).
@@ -274,12 +330,10 @@ echo ""
 echo "============================================================================="
 echo "                         KONFIGURASI PENGUJIAN"
 echo "============================================================================="
-echo "  LITTLE core   : ${LITTLE_CPUS}"
-echo "  BIG core      : ${BIG_CPUS}"
-echo "  BIG+LITTLE    : ${ALL_CPUS}"
+echo "  LITTLE core   : ${LITTLE_CPUS} (${N_LITTLE} core)"
+echo "  BIG core      : ${BIG_CPUS} (${N_BIG} core)"
 echo "  Program       : ${PROGRAM_LIST[*]}"
-echo "  Thread        : ${THREAD_LIST[*]}"
-echo "  Himpunan core : ${CORESET_LIST[*]}"
+echo "  Skenario      : ${SCENARIO_LIST[*]}"
 echo "  Frame         : ${TOTAL_FRAMES}, run/skenario: ${NUM_RUNS} (run 1 = cold-start)"
 echo "  perf          : $([ "$PERF" = "1" ] && echo "ON (${PERF_EVENTS})" || echo "OFF")"
 echo "  Folder hasil  : ${RESULT_DIR}"
@@ -289,10 +343,8 @@ echo "  Folder hasil  : ${RESULT_DIR}"
     echo "compiler=$($CC --version | head -1)"
     echo "little_cpus=${LITTLE_CPUS}"
     echo "big_cpus=${BIG_CPUS}"
-    echo "all_cpus=${ALL_CPUS}"
     echo "programs=${PROGRAM_LIST[*]}"
-    echo "threads=${THREAD_LIST[*]}"
-    echo "coresets=${CORESET_LIST[*]}"
+    echo "scenarios=${SCENARIO_LIST[*]}"
     echo "frames=${TOTAL_FRAMES}"
     echo "runs=${NUM_RUNS}"
     echo "perf=${PERF} events=${PERF_EVENTS}"
@@ -309,128 +361,132 @@ RAW_CSV="${RESULT_DIR}/raw_timings.csv"
 LAYER_CSV="${RESULT_DIR}/layer_timings.csv"
 PERF_CSV="${RESULT_DIR}/perf_counters.csv"
 SUMMARY_CSV="${RESULT_DIR}/summary.csv"
-echo "scenario,program,coreset,cpus,threads,run,inference_ms,process_wall_ms,excluded_from_avg,exit_ok" > "$RAW_CSV"
-echo "scenario,program,coreset,cpus,run,layout,threads,frames,width,height,layer,name,time_ms_per_frame,time_pct,gflops,ai_flop_per_byte,bw_min_gbs" > "$LAYER_CSV"
-[ "$PERF" = "1" ] && echo "scenario,program,coreset,threads,run,event,value,unit" > "$PERF_CSV"
+echo "scenario,program,skenario,little_threads,big_threads,cpus,threads,run,inference_ms,process_wall_ms,excluded_from_avg,exit_ok" > "$RAW_CSV"
+echo "scenario,program,skenario,cpus,run,layout,threads,frames,width,height,layer,name,time_ms_per_frame,time_pct,gflops,ai_flop_per_byte,bw_min_gbs" > "$LAYER_CSV"
+[ "$PERF" = "1" ] && echo "scenario,program,skenario,threads,run,event,value,unit" > "$PERF_CSV"
 
 declare -a SCEN_KEYS=()
 declare -A T_AVG T_MIN T_MAX T_STD T_COLD T_CONS
 
-total_scen=$(( ${#PROGRAM_LIST[@]} * ${#CORESET_LIST[@]} * ${#THREAD_LIST[@]} ))
+total_scen=$(( ${#PROGRAM_LIST[@]} * ${#SCENARIO_LIST[@]} ))
 scen_no=0
 
-for coreset in "${CORESET_LIST[@]}"; do
-    cpus=$(coreset_cpus "$coreset")
-    if [ -z "$cpus" ]; then
-        echo "[!] Himpunan core '${coreset}' kosong/tidak dikenal, dilewati."
-        continue
-    fi
-    n_cpus=$(count_cpus "$cpus")
+for sc in "${SCENARIO_LIST[@]}"; do
+    parse_scenario "$sc"
+    n_l=$SC_L
+    n_b=$SC_B
+    threads=$((n_l + n_b))
+    cpus=$(scenario_cpus "$sc")
+    affinity=$(scenario_affinity "$sc")
+    sc_id="${sc//+/_}"
 
-    for threads in "${THREAD_LIST[@]}"; do
-        for prog in "${PROGRAM_LIST[@]}"; do
-            scen_no=$((scen_no + 1))
-            key="${prog}|${coreset}|${threads}"
-            scen="${prog}_$(coreset_label "$coreset" | tr '+' '_')_${threads}T"
-            SCEN_KEYS+=("$key")
-            output_file="${RESULT_DIR}/output_${scen}.yuv"
+    for prog in "${PROGRAM_LIST[@]}"; do
+        scen_no=$((scen_no + 1))
+        key="${prog}|${sc}"
+        scen="${prog}_${sc_id}"
+        SCEN_KEYS+=("$key")
+        output_file="${RESULT_DIR}/output_${scen}.yuv"
 
-            echo "---------------------------------------------------------------------"
-            echo "[${scen_no}/${total_scen}] $(program_label "$prog") | $(coreset_label "$coreset") (cpu ${cpus}) | ${threads} thread"
-            if [ "$threads" -gt "$n_cpus" ]; then
-                echo "     Catatan: oversubscription (${threads} thread pada ${n_cpus} core)"
+        echo "---------------------------------------------------------------------"
+        echo "[${scen_no}/${total_scen}] $(program_label "$prog") | $(scenario_label "$sc") (cpu ${cpus}) | ${threads} thread"
+        echo "     GOMP_CPU_AFFINITY: ${affinity}"
+        if [ "$n_l" -gt "$N_LITTLE" ]; then
+            echo "     Catatan: oversubscription LITTLE (${n_l} thread pada ${N_LITTLE} core)"
+        fi
+        if [ "$n_b" -gt "$N_BIG" ]; then
+            echo "     Catatan: oversubscription BIG (${n_b} thread pada ${N_BIG} core)"
+        fi
+        echo "---------------------------------------------------------------------"
+
+        total_time=0
+        min_time=999999999
+        max_time=0
+        first_run_time=0
+        steady_runs=()
+
+        for ((run=1; run<=NUM_RUNS; run++)); do
+            rm -f "$output_file"
+            layer_tmp="${RESULT_DIR}/.layer_tmp.csv"
+            perf_tmp="${RESULT_DIR}/.perf_tmp.txt"
+            stdout_tmp="${RESULT_DIR}/.stdout_tmp.txt"
+            rm -f "$layer_tmp" "$perf_tmp" "$stdout_tmp"
+
+            start_time=$(get_time_ms)
+            exit_ok=1
+            run_program "$prog" "$threads" "$cpus" "$affinity" "$output_file" "$layer_tmp" "$perf_tmp" "$stdout_tmp" || exit_ok=0
+            end_time=$(get_time_ms)
+            wall_ms=$((end_time - start_time))
+
+            # Waktu utama = waktu inferensi FSRCNN() yang dicetak program (INFERENCE_MS),
+            # tanpa start/tutup proses, baca bobot, dan buka/tutup/baca/tulis file YUV.
+            elapsed=$(awk -F= '/^INFERENCE_MS=/ {printf "%d", $2 + 0.5; found=1} END {if (!found) print -1}' "$stdout_tmp" 2>/dev/null)
+            if [ -z "$elapsed" ] || [ "$elapsed" -lt 0 ]; then
+                echo "     [ERROR] INFERENCE_MS tidak ditemukan di keluaran program, memakai waktu proses total." >&2
+                elapsed=$wall_ms
+                exit_ok=0
             fi
-            echo "---------------------------------------------------------------------"
 
-            total_time=0
-            min_time=999999999
-            max_time=0
-            first_run_time=0
-            steady_runs=()
+            if [ "$exit_ok" -eq 0 ]; then
+                echo "     [ERROR] Program keluar dengan error pada run ${run}." >&2
+            fi
 
-            for ((run=1; run<=NUM_RUNS; run++)); do
-                rm -f "$output_file"
-                layer_tmp="${RESULT_DIR}/.layer_tmp.csv"
-                perf_tmp="${RESULT_DIR}/.perf_tmp.txt"
-                stdout_tmp="${RESULT_DIR}/.stdout_tmp.txt"
-                rm -f "$layer_tmp" "$perf_tmp" "$stdout_tmp"
+            # Data per lapisan (hanya program usulan yang menulisnya)
+            if [ -f "$layer_tmp" ]; then
+                awk -F, -v p="${scen},${prog},${sc},\"${cpus}\",${run}" 'NR > 1 {print p "," $0}' "$layer_tmp" >> "$LAYER_CSV"
+            fi
 
-                start_time=$(get_time_ms)
-                exit_ok=1
-                run_program "$prog" "$threads" "$cpus" "$output_file" "$layer_tmp" "$perf_tmp" "$stdout_tmp" || exit_ok=0
-                end_time=$(get_time_ms)
-                wall_ms=$((end_time - start_time))
+            # Hardware counter perf (format -x,: value,unit,event,...)
+            if [ "$PERF" = "1" ] && [ -f "$perf_tmp" ]; then
+                awk -F, -v p="${scen},${prog},${sc},${threads},${run}" \
+                    '!/^#/ && NF >= 3 && $3 != "" {print p "," $3 "," $1 "," $2}' "$perf_tmp" >> "$PERF_CSV"
+            fi
 
-                # Waktu utama = waktu inferensi FSRCNN() yang dicetak program (INFERENCE_MS),
-                # tanpa start/tutup proses, baca bobot, dan buka/tutup/baca/tulis file YUV.
-                elapsed=$(awk -F= '/^INFERENCE_MS=/ {printf "%d", $2 + 0.5; found=1} END {if (!found) print -1}' "$stdout_tmp" 2>/dev/null)
-                if [ -z "$elapsed" ] || [ "$elapsed" -lt 0 ]; then
-                    echo "     [ERROR] INFERENCE_MS tidak ditemukan di keluaran program, memakai waktu proses total." >&2
-                    elapsed=$wall_ms
-                    exit_ok=0
-                fi
-
-                if [ "$exit_ok" -eq 0 ]; then
-                    echo "     [ERROR] Program keluar dengan error pada run ${run}." >&2
-                fi
-
-                # Data per lapisan (hanya program usulan yang menulisnya)
-                if [ -f "$layer_tmp" ]; then
-                    awk -F, -v p="${scen},${prog},${coreset},\"${cpus}\",${run}" 'NR > 1 {print p "," $0}' "$layer_tmp" >> "$LAYER_CSV"
-                fi
-
-                # Hardware counter perf (format -x,: value,unit,event,...)
-                if [ "$PERF" = "1" ] && [ -f "$perf_tmp" ]; then
-                    awk -F, -v p="${scen},${prog},${coreset},${threads},${run}" \
-                        '!/^#/ && NF >= 3 && $3 != "" {print p "," $3 "," $1 "," $2}' "$perf_tmp" >> "$PERF_CSV"
-                fi
-
-                if [ "$run" -eq 1 ]; then
-                    first_run_time=$elapsed
-                    echo "${scen},${prog},${coreset},\"${cpus}\",${threads},${run},${elapsed},${wall_ms},yes,${exit_ok}" >> "$RAW_CSV"
-                    printf "     Run %d/%d (Cold-Start, DIKECUALIKAN dari rata-rata): inferensi %d ms (proses total %d ms)\n" "$run" "$NUM_RUNS" "$elapsed" "$wall_ms"
-                else
-                    total_time=$((total_time + elapsed))
-                    steady_runs+=("$elapsed")
-                    [ "$elapsed" -lt "$min_time" ] && min_time=$elapsed
-                    [ "$elapsed" -gt "$max_time" ] && max_time=$elapsed
-                    echo "${scen},${prog},${coreset},\"${cpus}\",${threads},${run},${elapsed},${wall_ms},no,${exit_ok}" >> "$RAW_CSV"
-                    printf "     Run %d/%d (Steady-State): inferensi %d ms (proses total %d ms)\n" "$run" "$NUM_RUNS" "$elapsed" "$wall_ms"
-                fi
-            done
-            rm -f "${RESULT_DIR}/.layer_tmp.csv" "${RESULT_DIR}/.perf_tmp.txt" "${RESULT_DIR}/.stdout_tmp.txt"
-
-            steady_count=$((NUM_RUNS - 1))
-            avg_time=$((total_time / steady_count))
-            T_AVG[$key]=$avg_time
-            T_MIN[$key]=$min_time
-            T_MAX[$key]=$max_time
-            T_COLD[$key]=$first_run_time
-            T_STD[$key]=$(printf '%s\n' "${steady_runs[@]}" | awk -v avg="$avg_time" '{s+=($1-avg)^2; n++} END {if(n>0) printf "%.1f", sqrt(s/n); else print "0.0"}')
-
-            # Cek konsistensi output run terakhir terhadap ground truth
-            if [ -f "$output_file" ] && [ -f "$GROUND_TRUTH" ]; then
-                if cmp -s "$GROUND_TRUTH" "$output_file"; then
-                    T_CONS[$key]="IDENTIK"
-                else
-                    diff_bytes=$(cmp -l "$GROUND_TRUTH" "$output_file" 2>/dev/null | wc -l | tr -d ' ')
-                    T_CONS[$key]="BERBEDA(${diff_bytes}B)"
-                fi
+            raw_prefix="${scen},${prog},${sc},${n_l},${n_b},\"${cpus}\",${threads},${run},${elapsed},${wall_ms}"
+            if [ "$run" -eq 1 ]; then
+                first_run_time=$elapsed
+                echo "${raw_prefix},yes,${exit_ok}" >> "$RAW_CSV"
+                printf "     Run %d/%d (Cold-Start, DIKECUALIKAN dari rata-rata): inferensi %d ms (proses total %d ms)\n" "$run" "$NUM_RUNS" "$elapsed" "$wall_ms"
             else
-                T_CONS[$key]="TIDAK_ADA"
-            fi
-            [ "$KEEP_OUTPUT" = "1" ] || rm -f "$output_file"
-
-            echo ""
-            printf "     Rata-rata (steady-state, n=%d): %d ms (StdDev: %s ms) | Output: %s\n" \
-                "$steady_count" "$avg_time" "${T_STD[$key]}" "${T_CONS[$key]}"
-            echo ""
-
-            if [ "$scen_no" -lt "$total_scen" ] && [ "$COOLDOWN" -gt 0 ]; then
-                echo "     [...] Cooldown ${COOLDOWN} detik..."
-                sleep "$COOLDOWN"
+                total_time=$((total_time + elapsed))
+                steady_runs+=("$elapsed")
+                [ "$elapsed" -lt "$min_time" ] && min_time=$elapsed
+                [ "$elapsed" -gt "$max_time" ] && max_time=$elapsed
+                echo "${raw_prefix},no,${exit_ok}" >> "$RAW_CSV"
+                printf "     Run %d/%d (Steady-State): inferensi %d ms (proses total %d ms)\n" "$run" "$NUM_RUNS" "$elapsed" "$wall_ms"
             fi
         done
+        rm -f "${RESULT_DIR}/.layer_tmp.csv" "${RESULT_DIR}/.perf_tmp.txt" "${RESULT_DIR}/.stdout_tmp.txt"
+
+        steady_count=$((NUM_RUNS - 1))
+        avg_time=$((total_time / steady_count))
+        T_AVG[$key]=$avg_time
+        T_MIN[$key]=$min_time
+        T_MAX[$key]=$max_time
+        T_COLD[$key]=$first_run_time
+        T_STD[$key]=$(printf '%s\n' "${steady_runs[@]}" | awk -v avg="$avg_time" '{s+=($1-avg)^2; n++} END {if(n>0) printf "%.1f", sqrt(s/n); else print "0.0"}')
+
+        # Cek konsistensi output run terakhir terhadap ground truth
+        if [ -f "$output_file" ] && [ -f "$GROUND_TRUTH" ]; then
+            if cmp -s "$GROUND_TRUTH" "$output_file"; then
+                T_CONS[$key]="IDENTIK"
+            else
+                diff_bytes=$(cmp -l "$GROUND_TRUTH" "$output_file" 2>/dev/null | wc -l | tr -d ' ')
+                T_CONS[$key]="BERBEDA(${diff_bytes}B)"
+            fi
+        else
+            T_CONS[$key]="TIDAK_ADA"
+        fi
+        [ "$KEEP_OUTPUT" = "1" ] || rm -f "$output_file"
+
+        echo ""
+        printf "     Rata-rata (steady-state, n=%d): %d ms (StdDev: %s ms) | Output: %s\n" \
+            "$steady_count" "$avg_time" "${T_STD[$key]}" "${T_CONS[$key]}"
+        echo ""
+
+        if [ "$scen_no" -lt "$total_scen" ] && [ "$COOLDOWN" -gt 0 ]; then
+            echo "     [...] Cooldown ${COOLDOWN} detik..."
+            sleep "$COOLDOWN"
+        fi
     done
 done
 
@@ -447,18 +503,20 @@ echo "==========================================================================
 echo "        RINGKASAN HASIL (waktu inferensi FSRCNN, ms; tanpa buka/tutup program)"
 echo "============================================================================="
 echo ""
-echo "scenario_key,program,coreset,threads,avg_ms,min_ms,max_ms,stddev_ms,cold_start_ms,fps,output_check" > "$SUMMARY_CSV"
+echo "scenario_key,program,skenario,little_threads,big_threads,threads,avg_ms,min_ms,max_ms,stddev_ms,cold_start_ms,fps,output_check" > "$SUMMARY_CSV"
 
-printf "%-22s | %-10s | %3s | %9s | %9s | %9s | %8s | %8s | %s\n" \
-    "Program" "Core" "Thr" "Inf Avg" "Inf Min" "Inf Max" "StdDev" "FPS" "Output"
-printf -- "%.0s-" {1..110}; echo ""
+printf "%-20s | %-18s | %3s | %9s | %9s | %9s | %8s | %8s | %s\n" \
+    "Program" "Skenario" "Thr" "Inf Avg" "Inf Min" "Inf Max" "StdDev" "FPS" "Output"
+printf -- "%.0s-" {1..118}; echo ""
 for key in "${SCEN_KEYS[@]}"; do
-    IFS='|' read -r prog coreset threads <<< "$key"
+    IFS='|' read -r prog sc <<< "$key"
+    parse_scenario "$sc"
+    threads=$((SC_L + SC_B))
     fps=$(fps_of "${T_AVG[$key]}")
-    printf "%-22s | %-10s | %3s | %9d | %9d | %9d | %8s | %8s | %s\n" \
-        "$(program_label "$prog")" "$(coreset_label "$coreset")" "$threads" \
+    printf "%-20s | %-18s | %3s | %9d | %9d | %9d | %8s | %8s | %s\n" \
+        "$(program_label "$prog")" "$(scenario_label "$sc")" "$threads" \
         "${T_AVG[$key]}" "${T_MIN[$key]}" "${T_MAX[$key]}" "${T_STD[$key]}" "$fps" "${T_CONS[$key]}"
-    echo "${prog}_${coreset}_${threads},${prog},${coreset},${threads},${T_AVG[$key]},${T_MIN[$key]},${T_MAX[$key]},${T_STD[$key]},${T_COLD[$key]},${fps},${T_CONS[$key]}" >> "$SUMMARY_CSV"
+    echo "${prog}_${sc//+/_},${prog},${sc},${SC_L},${SC_B},${threads},${T_AVG[$key]},${T_MIN[$key]},${T_MAX[$key]},${T_STD[$key]},${T_COLD[$key]},${fps},${T_CONS[$key]}" >> "$SUMMARY_CSV"
 done
 echo ""
 
@@ -471,88 +529,88 @@ has_prog() {
 
 if has_prog NAIVE && has_prog HWC; then
     echo "============================================================================="
-    echo "  SPEEDUP USULAN HWC vs NAIF CHW (thread & himpunan core sama; >1 = usulan lebih cepat)"
+    echo "  SPEEDUP USULAN HWC vs NAIF CHW (skenario sama; >1 = usulan lebih cepat)"
     echo "============================================================================="
-    printf "%-10s | %3s | %14s | %14s | %s\n" "Core" "Thr" "Naif CHW (ms)" "Usulan HWC (ms)" "Speedup"
+    printf "%-18s | %14s | %15s | %s\n" "Skenario" "Naif CHW (ms)" "Usulan HWC (ms)" "Speedup"
     printf -- "%.0s-" {1..66}; echo ""
-    for coreset in "${CORESET_LIST[@]}"; do
-        for threads in "${THREAD_LIST[@]}"; do
-            n="${T_AVG[NAIVE|$coreset|$threads]:-0}"
-            h="${T_AVG[HWC|$coreset|$threads]:-0}"
-            printf "%-10s | %3s | %14s | %15s | %sx\n" "$(coreset_label "$coreset")" "$threads" \
-                "$n" "$h" "$(ratio_of "$n" "$h")"
-        done
+    for sc in "${SCENARIO_LIST[@]}"; do
+        n="${T_AVG[NAIVE|$sc]:-0}"
+        h="${T_AVG[HWC|$sc]:-0}"
+        printf "%-18s | %14s | %15s | %sx\n" "$(scenario_label "$sc")" "$n" "$h" "$(ratio_of "$n" "$h")"
     done
     echo ""
 fi
 
 # ===================== SKALABILITAS =====================
+# Speedup tiap skenario terhadap 1 thread LITTLE (1L) dan 1 thread BIG (1B) pada program sama.
 echo "============================================================================="
-echo "     SKALABILITAS (speedup terhadap 1 thread pada program & himpunan core sama)"
+echo "  SKALABILITAS (speedup terhadap 1 LITTLE dan 1 BIG pada program yang sama)"
 echo "============================================================================="
-printf "%-22s | %-10s" "Program" "Core"
-for threads in "${THREAD_LIST[@]}"; do printf " | %7sT" "$threads"; done
-echo ""
+printf "%-20s | %-18s | %9s | %10s | %10s\n" "Program" "Skenario" "Avg (ms)" "vs 1 LIT" "vs 1 BIG"
 printf -- "%.0s-" {1..80}; echo ""
 for prog in "${PROGRAM_LIST[@]}"; do
-    for coreset in "${CORESET_LIST[@]}"; do
-        base="${T_AVG[$prog|$coreset|1]:-0}"
-        printf "%-22s | %-10s" "$(program_label "$prog")" "$(coreset_label "$coreset")"
-        for threads in "${THREAD_LIST[@]}"; do
-            printf " | %7sx" "$(ratio_of "$base" "${T_AVG[$prog|$coreset|$threads]:-0}")"
-        done
-        echo ""
+    base_l="${T_AVG[$prog|1L]:-0}"
+    base_b="${T_AVG[$prog|1B]:-0}"
+    for sc in "${SCENARIO_LIST[@]}"; do
+        t="${T_AVG[$prog|$sc]:-0}"
+        printf "%-20s | %-18s | %9s | %9sx | %9sx\n" "$(program_label "$prog")" "$(scenario_label "$sc")" \
+            "$t" "$(ratio_of "$base_l" "$t")" "$(ratio_of "$base_b" "$t")"
     done
 done
-[ -z "${T_AVG[${PROGRAM_LIST[0]}|${CORESET_LIST[0]}|1]:-}" ] && echo "(N/A: THREAD_LIST tidak memuat 1 thread)"
+echo "(N/A: skenario 1L / 1B tidak ada di SCENARIO_LIST)"
 echo ""
 
 # ===================== GRAFIK (GNUPLOT) =====================
 echo "============================================================================="
 echo "                  MENULIS DATA & MEMBUAT GRAFIK (GNUPLOT)"
 echo "============================================================================="
-for coreset in "${CORESET_LIST[@]}"; do
-    dat="${RESULT_DIR}/fps_${coreset}.dat"
-    {
-        printf "# threads"
-        for prog in "${PROGRAM_LIST[@]}"; do printf " %s" "$prog"; done
-        echo ""
-        for threads in "${THREAD_LIST[@]}"; do
-            printf "%s" "$threads"
-            for prog in "${PROGRAM_LIST[@]}"; do
-                v=$(fps_of "${T_AVG[$prog|$coreset|$threads]:-0}")
-                [ "$v" = "N/A" ] && v="NaN"
-                printf " %s" "$v"
-            done
-            echo ""
-        done
-    } > "$dat"
-
-    if command -v gnuplot &> /dev/null; then
-        plot_cmd=""
-        col=2
+dat="${RESULT_DIR}/fps_scenarios.dat"
+{
+    printf "# skenario"
+    for prog in "${PROGRAM_LIST[@]}"; do printf " %s" "$prog"; done
+    echo ""
+    for sc in "${SCENARIO_LIST[@]}"; do
+        printf "\"%s\"" "$(scenario_label "$sc")"
         for prog in "${PROGRAM_LIST[@]}"; do
-            [ -n "$plot_cmd" ] && plot_cmd="${plot_cmd}, "
-            plot_cmd="${plot_cmd}'${dat}' using 1:${col} with linespoints lw 2 pt 7 title '$(program_label "$prog")'"
-            col=$((col + 1))
+            v=$(fps_of "${T_AVG[$prog|$sc]:-0}")
+            [ "$v" = "N/A" ] && v="NaN"
+            printf " %s" "$v"
         done
-        gnuplot <<EOF
-set terminal pngcairo size 800,600 enhanced font 'Helvetica,11'
-set output '${RESULT_DIR}/fps_${coreset}.png'
-set title "FSRCNN Throughput - $(coreset_label "$coreset") core\n(Lebih tinggi lebih baik)" font 'Helvetica-Bold,14'
-set xlabel "Jumlah thread" font 'Helvetica-Bold,12'
+        echo ""
+    done
+} > "$dat"
+
+if command -v gnuplot &> /dev/null; then
+    plot_cmd=""
+    col=2
+    for prog in "${PROGRAM_LIST[@]}"; do
+        if [ -z "$plot_cmd" ]; then
+            plot_cmd="'${dat}' using ${col}:xtic(1) title '$(program_label "$prog")'"
+        else
+            plot_cmd="${plot_cmd}, '' using ${col} title '$(program_label "$prog")'"
+        fi
+        col=$((col + 1))
+    done
+    gnuplot <<EOF
+set terminal pngcairo size 1000,600 enhanced font 'Helvetica,11'
+set output '${RESULT_DIR}/fps_scenarios.png'
+set title "FSRCNN Throughput per Skenario\n(Lebih tinggi lebih baik)" font 'Helvetica-Bold,14'
+set xlabel "Skenario (jumlah thread per jenis core)" font 'Helvetica-Bold,12'
 set ylabel "Throughput (FPS)" font 'Helvetica-Bold,12'
-set grid lc rgb "#dddddd"
-set logscale x 2
-set xtics ($(join_cpus "${THREAD_LIST[@]}"))
+set grid ytics lc rgb "#dddddd"
+set style data histogram
+set style histogram clustered gap 1
+set style fill solid 0.8 border -1
+set boxwidth 0.9
+set xtics rotate by -30
 set yrange [0:*]
 set key top left
 plot ${plot_cmd}
 EOF
-        echo "  [✓] Grafik: ${RESULT_DIR}/fps_${coreset}.png"
-    fi
-done
-command -v gnuplot &> /dev/null || echo "  [!] gnuplot tidak ditemukan, grafik dilewati (data .dat tetap ditulis)."
+    echo "  [✓] Grafik: ${RESULT_DIR}/fps_scenarios.png"
+else
+    echo "  [!] gnuplot tidak ditemukan, grafik dilewati (data .dat tetap ditulis)."
+fi
 echo ""
 
 echo "  Ringkasan            : ${SUMMARY_CSV}"
