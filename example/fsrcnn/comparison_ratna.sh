@@ -38,7 +38,7 @@
 #   COOLDOWN=10                   jeda (detik) antar skenario
 #   PERF=1                        rekam hardware counter dengan perf stat
 #   PERF_EVENTS="..."             daftar event perf (default di bawah)
-#   KEEP_OUTPUT=1                 simpan file YUV keluaran tiap skenario
+#   KEEP_OUTPUT=0                 hapus file YUV keluaran (default 1 = disimpan untuk dicek)
 #   NO_PAUSE=1                    jangan menunggu Enter sebelum jendela terminal ditutup
 ###############################################################################
 
@@ -65,7 +65,7 @@ OUT_HEIGHT=$((HEIGHT * 2))
 TOTAL_FRAMES="${TOTAL_FRAMES:-150}"
 NUM_RUNS="${NUM_RUNS:-5}"
 COOLDOWN="${COOLDOWN:-10}"
-KEEP_OUTPUT="${KEEP_OUTPUT:-0}"
+KEEP_OUTPUT="${KEEP_OUTPUT:-1}"
 PERF="${PERF:-0}"
 PERF_EVENTS="${PERF_EVENTS:-task-clock,cycles,instructions,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses}"
 
@@ -142,7 +142,7 @@ fi
 
 # Program dijalankan dari SCRIPT_DIR karena membaca weights_layer*.txt secara relatif
 cd "$SCRIPT_DIR"
-mkdir -p "$RESULT_DIR"
+mkdir -p "$RESULT_DIR" "${RESULT_DIR}/stdout"
 
 # ===================== FUNGSI UTILITAS =====================
 
@@ -408,7 +408,7 @@ for sc in "${SCENARIO_LIST[@]}"; do
             rm -f "$output_file"
             layer_tmp="${RESULT_DIR}/.layer_tmp.csv"
             perf_tmp="${RESULT_DIR}/.perf_tmp.txt"
-            stdout_tmp="${RESULT_DIR}/.stdout_tmp.txt"
+            stdout_tmp="${RESULT_DIR}/stdout/${scen}_run${run}.txt"
             rm -f "$layer_tmp" "$perf_tmp" "$stdout_tmp"
 
             start_time=$(get_time_ms)
@@ -455,7 +455,7 @@ for sc in "${SCENARIO_LIST[@]}"; do
                 printf "     Run %d/%d (Steady-State): inferensi %d ms (proses total %d ms)\n" "$run" "$NUM_RUNS" "$elapsed" "$wall_ms"
             fi
         done
-        rm -f "${RESULT_DIR}/.layer_tmp.csv" "${RESULT_DIR}/.perf_tmp.txt" "${RESULT_DIR}/.stdout_tmp.txt"
+        rm -f "${RESULT_DIR}/.layer_tmp.csv" "${RESULT_DIR}/.perf_tmp.txt"
 
         steady_count=$((NUM_RUNS - 1))
         avg_time=$((total_time / steady_count))
@@ -615,6 +615,8 @@ echo ""
 
 echo "  Ringkasan            : ${SUMMARY_CSV}"
 echo "  Timing mentah        : ${RAW_CSV}"
+echo "  Keluaran program     : ${RESULT_DIR}/stdout/<skenario>_run<n>.txt"
+[ "$KEEP_OUTPUT" = "1" ] && echo "  Video keluaran (YUV) : ${RESULT_DIR}/output_<skenario>.yuv (run terakhir)"
 echo "  Waktu per lapisan    : ${LAYER_CSV} (hanya program usulan)"
 [ "$PERF" = "1" ] && echo "  Hardware counter     : ${PERF_CSV}"
 echo ""
